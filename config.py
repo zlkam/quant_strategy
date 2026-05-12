@@ -55,12 +55,20 @@ class IndicatorConfig:
     dsmo_bottom_threshold: float = 20.0
     dsmo_top_threshold: float = 80.0
 
-    # --- ADX (Average Directional Index) — NEW ---
+    # --- ADX (Average Directional Index) ---
     # ADX quantifies trend strength regardless of direction.
     # Wilder (1978) canonical threshold: ADX > 20 = trending.
     adx_period: int = 14
     adx_trend_threshold: float = 20.0    # above this → trending regime
     adx_transition_low: float = 15.0     # below this → ranging regime
+
+    # --- Choppiness Index (structural regime filter) ---
+    # Complements ADX: measures whether price is trending or choppy
+    # regardless of direction. CI > 61.8 = choppy/sideways (Fibonacci ratio).
+    # CI < 38.2 = strongly trending.
+    # Reference: E.W. Dreiss, "The Choppiness Index" (1992)
+    ci_period: int = 14
+    ci_choppy_threshold: float = 61.8    # above this → market is choppy/ranging
 
 
 # ---------------------------------------------------------------------------
@@ -105,6 +113,23 @@ class SignalConfig:
     short_entry: float = -40.0     # cross below → enter short
     short_exit: float = -15.0      # cross above → exit (cover) short
 
+    # --- Signal momentum filter (improvement #2) ---
+    # Enter only when conviction is BUILDING (rising for long, falling for short).
+    # Lookback for signal rate-of-change check at entry bar.
+    # OxfordStrat research: entering when ADX slope is rising outperforms
+    # entering on ADX level alone. Applied here to the composite signal.
+    momentum_lookback: int = 3         # bars for signal ROC calculation
+    require_momentum_entry: bool = False  # gate entries on signal momentum (disabled: too restrictive)
+
+    # --- Pyramiding entry (improvement #4) ---
+    # Scale into positions rather than all-in at first signal.
+    # Alt26 strategy (trustdan): pyramiding delivered +33.5% on SPY.
+    # Only the initial fraction is deployed at first entry.
+    pyramid_initial: float = 0.70      # 70% of target position at first entry
+    pyramid_add: float = 0.30          # 30% for second layer (single add to reach 100%)
+    pyramid_signal_boost: float = 8.0  # signal must improve by this many points
+    pyramid_max_bars: int = 30         # within this many bars to add a layer
+
 
 # ---------------------------------------------------------------------------
 # Regime Filter (ADX-based)
@@ -113,23 +138,38 @@ class SignalConfig:
 @dataclass
 class RegimeConfig:
     """
-    ADX-based regime filter that scales the effective signal weight.
+    Dual regime filter: ADX (sigmoid-blended) + Choppiness Index.
 
-    Trend-following indicators (AMA, SMFI, DSMO) have no edge in
-    ranging / consolidating markets — their signals are noise.
-    This filter gates exposure accordingly:
+    Improvement #3 (CI) + #5 (sigmoid): replaces binary ADX zones with
+    a smooth sigmoid transition AND adds a structural filter that gates
+    exposure when the market is structurally choppy regardless of ADX.
 
-      ADX > 20  → trending    → full signal weight (1.0)
-      ADX 15-20 → transitional → half signal weight (0.50)
-      ADX < 15  → ranging     → flat, no exposure (0.0)
+    Sigmoid blending (improvement #5):
+      weight = sigmoid((ADX - midpoint) / steepness)
+      Smooth 0→1 transition, no sharp boundaries → fewer whipsaws.
 
-    The transitional zone (15-20, rather than a hard cutoff at 20)
-    provides gradualism and reduces whipsaw at regime boundaries.
+    Choppiness Index gate (improvement #3):
+      CI > 61.8 → market is choppy/sideways → block entries
+      OxfordStrat finding: ADX alone may reduce performance. Its value
+      emerges when combined with structural filters.
+
+    The dual gate requires BOTH conditions: ADX-based weight > 0 AND CI below threshold.
     """
 
-    trending_weight: float = 1.0
-    transitional_weight: float = 0.50
-    ranging_weight: float = 0.0
+    # Sigmoid blending (improvement #5) — replaces binary trending/transitional/ranging
+    sigmoid_midpoint: float = 17.5     # ADX level where weight = 0.5
+    sigmoid_steepness: float = 2.5     # higher = sharper transition
+    use_sigmoid: bool = True           # False → revert to binary 3-zone ADX
+    trending_weight: float = 1.0       # used only if use_sigmoid=False
+    transitional_weight: float = 0.50  # used only if use_sigmoid=False
+    ranging_weight: float = 0.0        # used only if use_sigmoid=False
+    # Minimum ADX for sigmoid to give weight (floor — prevents zero exposure
+    # in very low ADX where we want to be flat)
+    adx_floor: float = 8.0             # ADX below this → forced weight = 0
+
+    # Choppiness Index dual gate (improvement #3)
+    ci_choppy_threshold: float = 75.0  # above this → market is choppy → reduce exposure (further relaxed)
+    ci_gate_enabled: bool = True       # False → revert to ADX-only filter
 
 
 # ---------------------------------------------------------------------------
@@ -162,15 +202,27 @@ class RiskConfig:
     initial_capital: float = 1_000_000.0
 
     # Volatility targeting
-    target_vol_annual: float = 0.15     # 15% annualized target vol
+    target_vol_annual: float = 0.20     # 20% annualized target vol (increased from 15%)
     vol_lookback: int = 20              # bars for realized vol computation
-    max_exposure: float = 1.0           # cap long exposure at 100%
-    min_exposure: float = -1.0          # cap short exposure at 100%
+    max_exposure: float = 1.5           # cap long exposure at 150% (modest leverage)
+    min_exposure: float = -1.5          # cap short exposure at 150%
 
     # Dynamic trailing stop ATR multipliers (SMFI-gated)
     atr_accumulation: float = 3.0       # SMFI > 60 — let winners run
     atr_base: float = 2.0               # SMFI 40-60 — standard
     atr_distribution: float = 1.0       # SMFI < 40 — cut fast
+
+    # --- Multi-stage profit targets (improvement #1) ---
+    # At entry, lock ATR-based take-profit levels. Sell fractions at each.
+    # The remaining fraction trails with the dynamic stop.
+    # Research (trustdan 293-backtest study): multi-stage TP >> trailing-only.
+    # Levels based on ATR multiples above entry (long) / below entry (short).
+    # Wider levels (6N/12N/20N) so only genuine trend extensions trigger TP.
+    # Smaller fractions (15% each) so 55% of position continues to trail.
+    tp_levels: tuple[float, ...] = (6.0, 12.0, 20.0)     # ATR multiples
+    tp_fractions: tuple[float, ...] = (0.15, 0.15, 0.15)  # sell fraction at each level
+    # Remaining fraction (1 - 0.45) = 0.55 trails with dynamic stop
+    tp_enabled: bool = True
 
     # Per-ticker max drawdown circuit breakers
     # Keyed by ticker symbol; 'default' used for any ticker not listed.

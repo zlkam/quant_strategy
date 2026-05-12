@@ -165,6 +165,75 @@ class RiskManager:
         return reference_price + distance
 
     # ------------------------------------------------------------------
+    # Multi-Stage Profit Targets (Improvement #1)
+    # ------------------------------------------------------------------
+
+    def compute_profit_targets(
+        self,
+        entry_price: float,
+        entry_atr: float,
+        is_long: bool,
+    ) -> list[dict]:
+        """
+        Compute locked profit target levels at entry.
+
+        Each target is a dict: {price, fraction_to_sell, label}
+        Prices are ATR-multiples from the entry price, locked at entry
+        to prevent dynamic recalculation mid-trade (avoids backtest-to-live
+        divergence from shifting ATR).
+
+        For longs:  TP = entry_price + level * entry_ATR
+        For shorts: TP = entry_price - level * entry_ATR
+
+        The remaining fraction (1 - sum of all tp_fractions) is left to
+        trail with the dynamic stop.
+
+        Research basis (trustdan 293-backtest study):
+        Multi-stage profit targets with ATR-based levels consistently
+        outperform trailing-only exits by capturing trend extensions
+        without premature exits.
+
+        Parameters
+        ----------
+        entry_price : float
+            Execution price at entry.
+        entry_atr : float
+            ATR value at entry bar (locked, not dynamic).
+        is_long : bool
+            True for long positions, False for short.
+
+        Returns
+        -------
+        list[dict]
+            Sorted list of {price, fraction, label} dicts.
+            For longs: sorted ascending (closest TP first).
+            For shorts: sorted descending (closest TP first).
+        """
+        if not self.cfg.tp_enabled:
+            return []
+
+        levels = self.cfg.tp_levels
+        fractions = self.cfg.tp_fractions
+
+        targets = []
+        for i, (level, frac) in enumerate(zip(levels, fractions)):
+            if is_long:
+                tp_price = entry_price + level * entry_atr
+            else:
+                tp_price = entry_price - level * entry_atr
+            targets.append({
+                "price": round(tp_price, 4),
+                "fraction": frac,
+                "filled": False,
+                "label": f"TP{level}N",
+            })
+
+        # Sort: longs closest TP first, shorts closest TP first
+        targets.sort(key=lambda t: t["price"] if is_long else -t["price"])
+
+        return targets
+
+    # ------------------------------------------------------------------
     # Drawdown Circuit Breaker
     # ------------------------------------------------------------------
 

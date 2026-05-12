@@ -284,6 +284,219 @@ def compute_regime_weight(
 
 
 # ---------------------------------------------------------------------------
+# Choppiness Index (structural regime filter)
+# ---------------------------------------------------------------------------
+
+def compute_choppiness_index(df: pd.DataFrame, period: int = 14) -> pd.Series:
+    """
+    Compute the Choppiness Index (CI) — a structural regime indicator.
+
+    CI measures whether the market is trending or choppy (ranging),
+    regardless of direction. It complements ADX by capturing the
+    *structural* quality of price movement rather than directional strength.
+
+    Formula (Dreiss, 1992):
+      CI = 100 * log10(SUM(ATR, n) / (HHV_n - LLV_n)) / log10(n)
+
+    Where:
+      - SUM(ATR, n) = sum of True Range over n bars (total path length)
+      - HHV_n - LLV_n = range over n bars (net distance traveled)
+      - The ratio compares "how far price traveled in total" vs "how far
+        it got"
+
+    Interpretation:
+      CI > 61.8  → market is choppy / sideways (Fibonacci ratio)
+      CI < 38.2  → market is strongly trending
+      CI 38.2-61.8 → transitional
+
+    Parameters
+    ----------
+    df : pd.DataFrame
+        Must contain columns: 'High', 'Low', 'Close'.
+    period : int, default 14
+        Lookback window for CI calculation.
+
+    Returns
+    -------
+    pd.Series
+        Choppiness Index values in [0, 100].
+
+    Notes
+    -----
+    During strong trends, price moves far (large HHV-LLV range) relative
+    to the total path length → CI is low. During consolidation, price
+    oscillates within a narrow range while ATR accumulates → CI is high.
+    The denominator log10(period) normalises for the lookback window size.
+    """
+    high = df["High"]
+    low = df["Low"]
+    close = df["Close"]
+
+    # True Range
+    tr = pd.DataFrame({
+        "hl": high - low,
+        "hc": (high - close.shift(1)).abs(),
+        "lc": (low - close.shift(1)).abs(),
+    }).max(axis=1)
+
+    # Total path length = rolling sum of TR over period bars
+    atr_sum = tr.rolling(window=period, min_periods=period).sum()
+
+    # Net distance = highest high - lowest low over period bars
+    hhv = high.rolling(window=period, min_periods=period).max()
+    llv = low.rolling(window=period, min_periods=period).min()
+    price_range = hhv - llv
+
+    # CI formula — clamp denominator to prevent division by zero
+    ratio = atr_sum / price_range.clip(lower=1e-10)
+    ci = 100.0 * np.log10(ratio) / np.log10(period)
+
+    return ci.clip(0.0, 100.0)
+
+
+# ---------------------------------------------------------------------------
+# Sigmoid Regime Weight (continuous blending)
+# ---------------------------------------------------------------------------
+
+def compute_sigmoid_regime_weight(
+    adx: pd.Series,
+    midpoint: float = 17.5,
+    steepness: float = 2.5,
+    floor: float = 12.0,
+) -> pd.Series:
+    """
+    Compute a continuous regime weight using sigmoid blending of ADX.
+
+    Improvement #5: replaces binary 3-zone ADX with a smooth sigmoid curve.
+    No hard boundaries → fewer whipsaw entries/exits at zone edges.
+
+      weight = 1 / (1 + exp(-(ADX - midpoint) / steepness))
+
+    At ADX = midpoint: weight ≈ 0.5
+    At ADX >> midpoint: weight → 1.0 (strongly trending)
+    At ADX << midpoint: weight → 0.0 (ranging)
+
+    A floor parameter forces weight to zero below a minimum ADX level
+    to prevent very weak trends from generating any exposure.
+
+    Parameters
+    ----------
+    adx : pd.Series
+        ADX values from compute_adx().
+    midpoint : float, default 17.5
+        ADX level at which weight = 0.5. Centered between the traditional
+        15 (ranging) and 20 (trending) thresholds.
+    steepness : float, default 2.5
+        Controls transition speed. Higher = sharper step. 2.5 gives a
+        smooth transition spanning roughly ±5 ADX points around midpoint.
+    floor : float, default 12.0
+        ADX below this is forced to weight = 0 regardless of sigmoid output.
+
+    Returns
+    -------
+    pd.Series
+        Continuous regime weight in [0.0, 1.0].
+    """
+    # Sigmoid: 1 / (1 + exp(-x))
+    x = (adx - midpoint) / steepness
+    adx_weight = 1.0 / (1.0 + np.exp(-x))
+
+    # Force zero below floor (prevent tiny exposure in clearly ranging markets)
+    adx_weight[adx < floor] = 0.0
+
+    # NaN ADX (warmup) → conservative, treat as ranging
+    adx_weight[adx.isna()] = 0.0
+
+    return adx_weight
+
+
+# ---------------------------------------------------------------------------
+# Dual Regime Weight (ADX sigmoid + Choppiness Index gate)
+# ---------------------------------------------------------------------------
+
+def compute_dual_regime_weight(
+    adx_weight: pd.Series,
+    choppiness: pd.Series,
+    ci_threshold: float = 61.8,
+    ci_enabled: bool = True,
+) -> pd.Series:
+    """
+    Combine ADX-based regime weight with Choppiness Index structural filter.
+
+    Improvement #3: the dual gate requires BOTH:
+      1. ADX sigmoid weight > 0 (trend has directional strength)
+      2. Choppiness Index < threshold (price is structurally trending,
+         not choppy)
+
+    When CI indicates choppy/ranging (CI > 61.8), the regime weight is
+    multiplied by 0.0 (blocked) regardless of ADX. This is the key
+    combination that OxfordStrat research found superior to ADX alone.
+
+    Parameters
+    ----------
+    adx_weight : pd.Series
+        Sigmoid ADX weight from compute_sigmoid_regime_weight().
+    choppiness : pd.Series
+        Choppiness Index from compute_choppiness_index().
+    ci_threshold : float, default 61.8
+        CI above this → market is structurally choppy → block exposure.
+        Fibonacci ratio 61.8 is the standard threshold per Dreiss (1992).
+    ci_enabled : bool, default True
+        If False, the CI gate is bypassed (used for A/B testing).
+
+    Returns
+    -------
+    pd.Series
+        Final dual regime weight in [0.0, 1.0].
+    """
+    weight = adx_weight.copy()
+
+    if ci_enabled:
+        # Block exposure when market is structurally choppy
+        is_choppy = choppiness > ci_threshold
+        weight[is_choppy] = 0.0
+
+    # NaN CI (warmup) → conservative, block until we have data
+    weight[choppiness.isna()] = 0.0
+
+    return weight
+
+
+# ---------------------------------------------------------------------------
+# Signal Momentum (ROC of effective signal, for entry gating)
+# ---------------------------------------------------------------------------
+
+def compute_signal_momentum(
+    effective_signal: pd.Series,
+    lookback: int = 3,
+) -> pd.Series:
+    """
+    Compute the rate-of-change of the effective signal over a lookback.
+
+    Used as an entry gate: only enter when conviction is BUILDING
+    (rising for longs, falling for shorts), not when it's fading.
+
+    This is the "rising ADX slope" concept applied to our composite
+    signal. OxfordStrat found entering when momentum is building
+    outperforms entering on level alone.
+
+    Parameters
+    ----------
+    effective_signal : pd.Series
+        The regime-gated, smoothed signal.
+    lookback : int, default 3
+        Bars to look back for ROC calculation.
+
+    Returns
+    -------
+    pd.Series
+        Signal momentum (positive = building bullish, negative = building bearish).
+    """
+    roc = effective_signal - effective_signal.shift(lookback)
+    return roc
+
+
+# ---------------------------------------------------------------------------
 # Effective Signal (regime-gated)
 # ---------------------------------------------------------------------------
 

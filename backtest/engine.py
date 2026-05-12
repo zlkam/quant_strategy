@@ -21,7 +21,11 @@ from strategy.signal import (
     compute_adx,
     compute_raw_signal,
     smooth_signal,
+    compute_choppiness_index,
     compute_regime_weight,
+    compute_sigmoid_regime_weight,
+    compute_dual_regime_weight,
+    compute_signal_momentum,
     compute_effective_signal,
     compute_hysteresis_state,
 )
@@ -135,6 +139,9 @@ class BacktestEngine:
 
         df["ADX"] = compute_adx(df, period=ic.adx_period)
 
+        # Choppiness Index — structural regime filter (improvement #3)
+        df["choppiness"] = compute_choppiness_index(df, period=ic.ci_period)
+
         return df
 
     # ------------------------------------------------------------------
@@ -146,8 +153,8 @@ class BacktestEngine:
         Build the full signal pipeline and append columns to df.
 
         Columns added:
-          raw_signal, smoothed_signal, regime_weight,
-          effective_signal, hysteresis_state
+          raw_signal, smoothed_signal, adx_weight, regime_weight,
+          effective_signal, signal_momentum, hysteresis_state
         """
         sc = self.sig_cfg
         rc = self.reg_cfg
@@ -165,20 +172,42 @@ class BacktestEngine:
             df["raw_signal"], period=sc.signal_ema_period
         )
 
-        # ADX regime gate
-        ic = self.ind_cfg
-        df["regime_weight"] = compute_regime_weight(
-            df["ADX"],
-            trend_threshold=ic.adx_trend_threshold,
-            transition_low=ic.adx_transition_low,
-            trending_weight=rc.trending_weight,
-            transitional_weight=rc.transitional_weight,
-            ranging_weight=rc.ranging_weight,
+        # Sigmoid ADX weight (improvement #5) — smooth continuous blending
+        # or fall back to binary 3-zone if use_sigmoid=False in config
+        if rc.use_sigmoid:
+            df["adx_weight"] = compute_sigmoid_regime_weight(
+                df["ADX"],
+                midpoint=rc.sigmoid_midpoint,
+                steepness=rc.sigmoid_steepness,
+                floor=rc.adx_floor,
+            )
+        else:
+            df["adx_weight"] = compute_regime_weight(
+                df["ADX"],
+                trend_threshold=self.ind_cfg.adx_trend_threshold,
+                transition_low=self.ind_cfg.adx_transition_low,
+                trending_weight=rc.trending_weight,
+                transitional_weight=rc.transitional_weight,
+                ranging_weight=rc.ranging_weight,
+            )
+
+        # Dual regime gate: ADX sigmoid + Choppiness Index (improvement #3)
+        df["regime_weight"] = compute_dual_regime_weight(
+            df["adx_weight"],
+            df["choppiness"],
+            ci_threshold=rc.ci_choppy_threshold,
+            ci_enabled=rc.ci_gate_enabled,
         )
 
         # Effective signal = smoothed × regime weight
         df["effective_signal"] = compute_effective_signal(
             df["smoothed_signal"], df["regime_weight"]
+        )
+
+        # Signal momentum — rate-of-change for entry gating (improvement #2)
+        df["signal_momentum"] = compute_signal_momentum(
+            df["effective_signal"],
+            lookback=sc.momentum_lookback,
         )
 
         # Hysteresis state machine (LONG / FLAT / SHORT)
@@ -212,12 +241,23 @@ class BacktestEngine:
         """
         init_cap = self.config.risk.initial_capital
         cash = init_cap
+        sc = self.sig_cfg
 
         # Position tracking
         shares = 0.0           # positive = long, negative = short
         avg_entry_price = 0.0   # weighted average entry price
         reference_price = 0.0   # highest close (long) or lowest close (short) for trailing stop
         bars_in_position = 0    # counter for trade duration
+
+        # Pyramiding state (improvement #4)
+        pyramid_count = 0           # number of additions made (0 = initial entry only)
+        last_pyramid_signal = 0.0   # abs effective_signal at last entry/add for comparison
+        entry_bar_idx = 0           # bar index of initial entry for time window
+        target_shares = 0.0         # full target position size from vol-targeted sizing
+        is_long_pos = True          # direction of current position
+
+        # Multi-stage TP state (improvement #1)
+        tp_targets: list[dict] = []  # list of {price, fraction, filled, label}
 
         trades: list[dict] = []
         bar_log: list[dict] = []
@@ -246,6 +286,7 @@ class BacktestEngine:
             raw_sig = float(sig_bar.get("raw_signal", 0.0))
             smooth_sig = float(sig_bar.get("smoothed_signal", 0.0))
             regime_w = float(sig_bar.get("regime_weight", 0.0))
+            signal_mom = float(sig_bar.get("signal_momentum", 0.0))
             hyst_state = int(sig_bar.get("hysteresis_state", 0))
             smfi_val = float(sig_bar.get("SMFI", 50.0))
             atr_val = float(sig_bar.get("ATR", 0.0))
@@ -253,65 +294,104 @@ class BacktestEngine:
 
             # --- State machine execution ---
             trade_action = None
+            tp_fill = None  # TP target that got filled this bar (for logging)
 
             if shares == 0:
                 # ---- FLAT ----
-                if hyst_state == 1:
-                    # Enter LONG
-                    sh, notional = self.risk_mgr.compute_position_size(
-                        cash, exec_open, eff_signal, vol
-                    )
-                    if sh > 0 and notional > 0:
-                        cash -= notional  # pay for shares
-                        shares = sh
-                        avg_entry_price = exec_open
-                        reference_price = exec_close
-                        bars_in_position = 0
-                        trade_action = {
-                            "Date": exec_date,
-                            "Ticker": ticker,
-                            "Action": "BUY",
-                            "Price": round(exec_open, 4),
-                            "Shares": round(shares, 4),
-                            "Notional": round(notional, 2),
-                            "Signal": round(eff_signal, 2),
-                            "SMFI": round(smfi_val, 2),
-                            "RealizedVol": round(vol * 100, 2),
-                            "PnL": 0.0,
-                            "PnL_Pct": 0.0,
-                            "Reason": f"hysteresis long entry (signal={eff_signal:.1f})",
-                        }
-                        trades.append(trade_action)
+                # Compute full target position (used for pyramiding reference)
+                sh_target, notional_target = self.risk_mgr.compute_position_size(
+                    cash, exec_open, eff_signal, vol
+                )
 
-                elif hyst_state == -1:
-                    # Enter SHORT — sell borrowed shares, receive proceeds
-                    sh, notional = self.risk_mgr.compute_position_size(
-                        cash, exec_open, eff_signal, vol
+                # Signal momentum gate (improvement #2):
+                # Only enter if conviction is BUILDING (rising for long, falling for short)
+                mom_ok = True
+                if sc.require_momentum_entry:
+                    if hyst_state == 1 and signal_mom <= 0:
+                        mom_ok = False  # signal not building bullish
+                    elif hyst_state == -1 and signal_mom >= 0:
+                        mom_ok = False  # signal not building bearish
+
+                if hyst_state == 1 and mom_ok and sh_target > 0:
+                    # Enter LONG — pyramid initial fraction (improvement #4)
+                    entry_fraction = sc.pyramid_initial
+                    sh = sh_target * entry_fraction
+                    notional = abs(sh) * exec_open
+                    cash -= notional
+                    shares = sh
+                    avg_entry_price = exec_open
+                    reference_price = exec_close
+                    bars_in_position = 0
+                    is_long_pos = True
+                    entry_bar_idx = i
+                    pyramid_count = 0
+                    last_pyramid_signal = abs(eff_signal)
+                    target_shares = sh_target
+
+                    # Locked TP targets at entry (improvement #1)
+                    tp_targets = self.risk_mgr.compute_profit_targets(
+                        exec_open, atr_val, is_long=True
                     )
-                    # For short: sh is negative, notional is positive (gross exposure)
-                    if sh < 0 and notional > 0:
-                        # Receive cash from short sale (sell borrowed shares)
-                        short_proceeds = abs(sh) * exec_open
-                        cash += short_proceeds
-                        shares = sh
-                        avg_entry_price = exec_open
-                        reference_price = exec_close  # track lowest close for short stop
-                        bars_in_position = 0
-                        trade_action = {
-                            "Date": exec_date,
-                            "Ticker": ticker,
-                            "Action": "SELL_SHORT",
-                            "Price": round(exec_open, 4),
-                            "Shares": round(shares, 4),
-                            "Notional": round(short_proceeds, 2),
-                            "Signal": round(eff_signal, 2),
-                            "SMFI": round(smfi_val, 2),
-                            "RealizedVol": round(vol * 100, 2),
-                            "PnL": 0.0,
-                            "PnL_Pct": 0.0,
-                            "Reason": f"hysteresis short entry (signal={eff_signal:.1f})",
-                        }
-                        trades.append(trade_action)
+
+                    trade_action = {
+                        "Date": exec_date,
+                        "Ticker": ticker,
+                        "Action": "BUY",
+                        "Price": round(exec_open, 4),
+                        "Shares": round(shares, 4),
+                        "Notional": round(notional, 2),
+                        "Signal": round(eff_signal, 2),
+                        "SignalMom": round(signal_mom, 2),
+                        "SMFI": round(smfi_val, 2),
+                        "RealizedVol": round(vol * 100, 2),
+                        "PnL": 0.0,
+                        "PnL_Pct": 0.0,
+                        "Pyramid": "1/3",
+                        "Reason": f"long entry (signal={eff_signal:.1f}, mom={signal_mom:+.1f})",
+                    }
+                    trades.append(trade_action)
+
+                elif hyst_state == -1 and mom_ok and sh_target < 0:
+                    # Enter SHORT — pyramid initial fraction
+                    entry_fraction = sc.pyramid_initial
+                    sh = sh_target * abs(entry_fraction)  # sh_target is negative, sh stays negative
+                    # Actually sh_target is negative, fraction is positive. Need careful handling.
+                    sh = sh_target * entry_fraction  # e.g., -1000 * 0.5 = -500
+                    notional = abs(sh) * exec_open
+                    short_proceeds = abs(sh) * exec_open
+                    cash += short_proceeds
+                    shares = sh
+                    avg_entry_price = exec_open
+                    reference_price = exec_close
+                    bars_in_position = 0
+                    is_long_pos = False
+                    entry_bar_idx = i
+                    pyramid_count = 0
+                    last_pyramid_signal = abs(eff_signal)
+                    target_shares = sh_target
+
+                    # Locked TP targets at entry (improvement #1)
+                    tp_targets = self.risk_mgr.compute_profit_targets(
+                        exec_open, atr_val, is_long=False
+                    )
+
+                    trade_action = {
+                        "Date": exec_date,
+                        "Ticker": ticker,
+                        "Action": "SELL_SHORT",
+                        "Price": round(exec_open, 4),
+                        "Shares": round(shares, 4),
+                        "Notional": round(short_proceeds, 2),
+                        "Signal": round(eff_signal, 2),
+                        "SignalMom": round(signal_mom, 2),
+                        "SMFI": round(smfi_val, 2),
+                        "RealizedVol": round(vol * 100, 2),
+                        "PnL": 0.0,
+                        "PnL_Pct": 0.0,
+                        "Pyramid": "1/3",
+                        "Reason": f"short entry (signal={eff_signal:.1f}, mom={signal_mom:+.1f})",
+                    }
+                    trades.append(trade_action)
 
             elif shares > 0:
                 # ---- LONG position ----
@@ -320,118 +400,276 @@ class BacktestEngine:
                 # Update trailing stop reference (highest close since entry)
                 reference_price = max(reference_price, exec_close)
 
-                # Check dynamic trailing stop
-                stop_level = self.risk_mgr.compute_stop_level(
-                    reference_price, atr_val, smfi_val, is_long=True
-                )
-                stop_hit = exec_close <= stop_level and atr_val > 0
+                # --- Multi-stage TP check (improvement #1) ---
+                # Check if any TP level was hit using this bar's high
+                tp_exit_shares = 0.0
+                tp_exit_reason = ""
+                for tp in tp_targets:
+                    if not tp["filled"] and exec_high >= tp["price"]:
+                        sell_frac = tp["fraction"]
+                        tp_exit_shares += shares * sell_frac
+                        tp["filled"] = True
+                        tp_fill = tp
+                        tp_exit_reason = f"TP {tp['label']} hit (target={tp['price']:.2f}, high={exec_high:.2f})"
 
-                # Exit conditions
-                exit_shares = 0.0
-                exit_reason = ""
-
-                if stop_hit:
-                    exit_shares = shares
-                    exit_reason = f"trailing stop hit (stop={stop_level:.2f}, close={exec_close:.2f})"
-                elif hyst_state == -1:
-                    # Signal flipped to SHORT — exit long and reverse
-                    exit_shares = shares
-                    exit_reason = f"signal reversal to SHORT (signal={eff_signal:.1f})"
-                elif hyst_state == 0:
-                    # Signal dropped below long_exit — exit
-                    exit_shares = shares
-                    exit_reason = f"hysteresis exit to FLAT (signal={eff_signal:.1f})"
-
-                if exit_shares > 0:
-                    exit_notional = exit_shares * exec_open
-                    cash += exit_notional
-                    pnl = exit_notional - exit_shares * avg_entry_price
-                    pnl_pct = (
+                if tp_exit_shares > 0:
+                    tp_exit_notional = tp_exit_shares * exec_open
+                    cash += tp_exit_notional
+                    tp_pnl = tp_exit_notional - tp_exit_shares * avg_entry_price
+                    tp_pnl_pct = (
                         (exec_open - avg_entry_price) / avg_entry_price * 100.0
-                        if avg_entry_price > 0
-                        else 0.0
+                        if avg_entry_price > 0 else 0.0
                     )
                     trades.append({
                         "Date": exec_date,
                         "Ticker": ticker,
                         "Action": "SELL",
                         "Price": round(exec_open, 4),
-                        "Shares": round(exit_shares, 4),
-                        "Notional": round(exit_notional, 2),
+                        "Shares": round(tp_exit_shares, 4),
+                        "Notional": round(tp_exit_notional, 2),
                         "Signal": round(eff_signal, 2),
                         "SMFI": round(smfi_val, 2),
-                        "RealizedVol": round(vol * 100, 2),
-                        "PnL": round(pnl, 2),
-                        "PnL_Pct": round(pnl_pct, 4),
+                        "PnL": round(tp_pnl, 2),
+                        "PnL_Pct": round(tp_pnl_pct, 4),
                         "BarsHeld": bars_in_position,
-                        "Reason": exit_reason,
+                        "Tier": tp_fill["label"] if tp_fill else "TP",
+                        "Reason": tp_exit_reason,
                     })
                     trade_action = trades[-1]
-                    shares = 0.0
-                    avg_entry_price = 0.0
-                    reference_price = 0.0
-                    bars_in_position = 0
+                    shares -= tp_exit_shares
+                    # If all shares sold via TP, reset position
+                    if shares <= 1e-8:
+                        shares = 0.0
+                        avg_entry_price = 0.0
+                        reference_price = 0.0
+                        bars_in_position = 0
+                        tp_targets = []
+
+                # --- Pyramid add check (improvement #4) ---
+                # Add to position if signal strengthens within the time window
+                if shares > 0 and pyramid_count < 2:
+                    bars_since_entry = i - entry_bar_idx
+                    signal_improved = abs(eff_signal) - last_pyramid_signal >= sc.pyramid_signal_boost
+                    if bars_since_entry <= sc.pyramid_max_bars and signal_improved and target_shares != 0:
+                        add_shares = target_shares * sc.pyramid_add
+                        add_notional = add_shares * exec_open
+                        cash -= add_notional
+                        # Weighted average entry price update
+                        avg_entry_price = (
+                            (avg_entry_price * shares + exec_open * add_shares)
+                            / (shares + add_shares)
+                        )
+                        shares += add_shares
+                        pyramid_count += 1
+                        last_pyramid_signal = abs(eff_signal)
+                        layer_label = f"{pyramid_count + 1}/3"
+                        trades.append({
+                            "Date": exec_date,
+                            "Ticker": ticker,
+                            "Action": "BUY",
+                            "Price": round(exec_open, 4),
+                            "Shares": round(add_shares, 4),
+                            "Notional": round(add_notional, 2),
+                            "Signal": round(eff_signal, 2),
+                            "SignalMom": round(signal_mom, 2),
+                            "SMFI": round(smfi_val, 2),
+                            "PnL": 0.0,
+                            "PnL_Pct": 0.0,
+                            "Pyramid": layer_label,
+                            "Reason": f"pyramid add (signal improved to {abs(eff_signal):.1f}, +{abs(eff_signal)-last_pyramid_signal+sc.pyramid_signal_boost:.1f}pts)",
+                        })
+
+                # --- Exit conditions (stop / reversal / hysteresis) ---
+                if shares > 0:
+                    stop_level = self.risk_mgr.compute_stop_level(
+                        reference_price, atr_val, smfi_val, is_long=True
+                    )
+                    stop_hit = exec_close <= stop_level and atr_val > 0
+
+                    exit_shares = 0.0
+                    exit_reason = ""
+
+                    if stop_hit:
+                        exit_shares = shares
+                        exit_reason = f"trailing stop hit (stop={stop_level:.2f}, close={exec_close:.2f})"
+                    elif hyst_state == -1:
+                        exit_shares = shares
+                        exit_reason = f"signal reversal to SHORT (signal={eff_signal:.1f})"
+                    elif hyst_state == 0:
+                        exit_shares = shares
+                        exit_reason = f"hysteresis exit to FLAT (signal={eff_signal:.1f})"
+
+                    if exit_shares > 0:
+                        exit_notional = exit_shares * exec_open
+                        cash += exit_notional
+                        pnl = exit_notional - exit_shares * avg_entry_price
+                        pnl_pct = (
+                            (exec_open - avg_entry_price) / avg_entry_price * 100.0
+                            if avg_entry_price > 0
+                            else 0.0
+                        )
+                        trades.append({
+                            "Date": exec_date,
+                            "Ticker": ticker,
+                            "Action": "SELL",
+                            "Price": round(exec_open, 4),
+                            "Shares": round(exit_shares, 4),
+                            "Notional": round(exit_notional, 2),
+                            "Signal": round(eff_signal, 2),
+                            "SMFI": round(smfi_val, 2),
+                            "RealizedVol": round(vol * 100, 2),
+                            "PnL": round(pnl, 2),
+                            "PnL_Pct": round(pnl_pct, 4),
+                            "BarsHeld": bars_in_position,
+                            "Reason": exit_reason,
+                        })
+                        trade_action = trades[-1]
+                        shares = 0.0
+                        avg_entry_price = 0.0
+                        reference_price = 0.0
+                        bars_in_position = 0
+                        tp_targets = []
 
             elif shares < 0:
                 # ---- SHORT position ----
                 bars_in_position += 1
 
                 # Update trailing stop reference (lowest close since entry)
-                reference_price = min(reference_price, exec_close) if reference_price != 0 else exec_close
+                if reference_price == 0:
+                    reference_price = exec_close
+                else:
+                    reference_price = min(reference_price, exec_close)
 
-                # Check dynamic trailing stop (reversed for shorts)
-                stop_level = self.risk_mgr.compute_stop_level(
-                    reference_price, atr_val, smfi_val, is_long=False
-                )
-                stop_hit = exec_close >= stop_level and atr_val > 0
+                # --- Multi-stage TP check (improvement #1) ---
+                # Check if any TP level was hit using this bar's low
+                tp_cover_shares = 0.0
+                tp_cover_reason = ""
+                for tp in tp_targets:
+                    if not tp["filled"] and exec_low <= tp["price"]:
+                        cover_frac = tp["fraction"]
+                        tp_cover_shares += abs(shares) * cover_frac
+                        tp["filled"] = True
+                        tp_fill = tp
+                        tp_cover_reason = f"TP {tp['label']} hit (target={tp['price']:.2f}, low={exec_low:.2f})"
 
-                # Cover conditions
-                cover_shares = 0.0
-                cover_reason = ""
-
-                if stop_hit:
-                    cover_shares = abs(shares)
-                    cover_reason = f"trailing stop hit (stop={stop_level:.2f}, close={exec_close:.2f})"
-                elif hyst_state == 1:
-                    # Signal flipped to LONG — cover and reverse
-                    cover_shares = abs(shares)
-                    cover_reason = f"signal reversal to LONG (signal={eff_signal:.1f})"
-                elif hyst_state == 0:
-                    # Signal rose above short_exit — cover
-                    cover_shares = abs(shares)
-                    cover_reason = f"hysteresis cover to FLAT (signal={eff_signal:.1f})"
-
-                if cover_shares > 0:
-                    # To cover short: buy back shares at exec_open
-                    cover_cost = cover_shares * exec_open
-                    cash -= cover_cost
-                    # PnL for short: entry_price - exit_price (profit when price falls)
-                    pnl = abs(shares) * avg_entry_price - cover_cost
-                    pnl_pct = (
+                if tp_cover_shares > 0:
+                    tp_cover_cost = tp_cover_shares * exec_open
+                    cash -= tp_cover_cost
+                    tp_pnl = tp_cover_shares * avg_entry_price - tp_cover_cost
+                    tp_pnl_pct = (
                         (avg_entry_price - exec_open) / avg_entry_price * 100.0
-                        if avg_entry_price > 0
-                        else 0.0
+                        if avg_entry_price > 0 else 0.0
                     )
                     trades.append({
                         "Date": exec_date,
                         "Ticker": ticker,
                         "Action": "BUY_TO_COVER",
                         "Price": round(exec_open, 4),
-                        "Shares": round(cover_shares, 4),
-                        "Notional": round(cover_cost, 2),
+                        "Shares": round(tp_cover_shares, 4),
+                        "Notional": round(tp_cover_cost, 2),
                         "Signal": round(eff_signal, 2),
                         "SMFI": round(smfi_val, 2),
-                        "RealizedVol": round(vol * 100, 2),
-                        "PnL": round(pnl, 2),
-                        "PnL_Pct": round(pnl_pct, 4),
+                        "PnL": round(tp_pnl, 2),
+                        "PnL_Pct": round(tp_pnl_pct, 4),
                         "BarsHeld": bars_in_position,
-                        "Reason": cover_reason,
+                        "Tier": tp_fill["label"] if tp_fill else "TP",
+                        "Reason": tp_cover_reason,
                     })
                     trade_action = trades[-1]
-                    shares = 0.0
-                    avg_entry_price = 0.0
-                    reference_price = 0.0
-                    bars_in_position = 0
+                    shares += tp_cover_shares  # shares is negative, so adding positive reduces |shares|
+                    # If all shares covered via TP, reset position
+                    if abs(shares) <= 1e-8:
+                        shares = 0.0
+                        avg_entry_price = 0.0
+                        reference_price = 0.0
+                        bars_in_position = 0
+                        tp_targets = []
+
+                # --- Pyramid add check (improvement #4) ---
+                # Add to short if signal strengthens (more negative) within time window
+                if shares < 0 and pyramid_count < 2:
+                    bars_since_entry = i - entry_bar_idx
+                    signal_improved = abs(eff_signal) - last_pyramid_signal >= sc.pyramid_signal_boost
+                    if bars_since_entry <= sc.pyramid_max_bars and signal_improved and target_shares != 0:
+                        add_shares = target_shares * sc.pyramid_add  # negative
+                        add_notional = abs(add_shares) * exec_open
+                        short_proceeds = abs(add_shares) * exec_open
+                        cash += short_proceeds
+                        # Weighted average entry price update
+                        avg_entry_price = (
+                            (avg_entry_price * abs(shares) + exec_open * abs(add_shares))
+                            / (abs(shares) + abs(add_shares))
+                        )
+                        shares += add_shares  # more negative
+                        pyramid_count += 1
+                        last_pyramid_signal = abs(eff_signal)
+                        layer_label = f"{pyramid_count + 1}/3"
+                        trades.append({
+                            "Date": exec_date,
+                            "Ticker": ticker,
+                            "Action": "SELL_SHORT",
+                            "Price": round(exec_open, 4),
+                            "Shares": round(add_shares, 4),
+                            "Notional": round(short_proceeds, 2),
+                            "Signal": round(eff_signal, 2),
+                            "SignalMom": round(signal_mom, 2),
+                            "SMFI": round(smfi_val, 2),
+                            "PnL": 0.0,
+                            "PnL_Pct": 0.0,
+                            "Pyramid": layer_label,
+                            "Reason": f"pyramid add short (signal improved to {abs(eff_signal):.1f})",
+                        })
+
+                # --- Cover conditions (stop / reversal / hysteresis) ---
+                if shares < 0:
+                    stop_level = self.risk_mgr.compute_stop_level(
+                        reference_price, atr_val, smfi_val, is_long=False
+                    )
+                    stop_hit = exec_close >= stop_level and atr_val > 0
+
+                    cover_shares = 0.0
+                    cover_reason = ""
+
+                    if stop_hit:
+                        cover_shares = abs(shares)
+                        cover_reason = f"trailing stop hit (stop={stop_level:.2f}, close={exec_close:.2f})"
+                    elif hyst_state == 1:
+                        cover_shares = abs(shares)
+                        cover_reason = f"signal reversal to LONG (signal={eff_signal:.1f})"
+                    elif hyst_state == 0:
+                        cover_shares = abs(shares)
+                        cover_reason = f"hysteresis cover to FLAT (signal={eff_signal:.1f})"
+
+                    if cover_shares > 0:
+                        cover_cost = cover_shares * exec_open
+                        cash -= cover_cost
+                        pnl = abs(shares) * avg_entry_price - cover_cost
+                        pnl_pct = (
+                            (avg_entry_price - exec_open) / avg_entry_price * 100.0
+                            if avg_entry_price > 0
+                            else 0.0
+                        )
+                        trades.append({
+                            "Date": exec_date,
+                            "Ticker": ticker,
+                            "Action": "BUY_TO_COVER",
+                            "Price": round(exec_open, 4),
+                            "Shares": round(cover_shares, 4),
+                            "Notional": round(cover_cost, 2),
+                            "Signal": round(eff_signal, 2),
+                            "SMFI": round(smfi_val, 2),
+                            "RealizedVol": round(vol * 100, 2),
+                            "PnL": round(pnl, 2),
+                            "PnL_Pct": round(pnl_pct, 4),
+                            "BarsHeld": bars_in_position,
+                            "Reason": cover_reason,
+                        })
+                        trade_action = trades[-1]
+                        shares = 0.0
+                        avg_entry_price = 0.0
+                        reference_price = 0.0
+                        bars_in_position = 0
+                        tp_targets = []
 
             # --- After exit reversal, check for opposite entry on same bar ---
             if shares == 0 and trade_action is not None:
@@ -461,8 +699,11 @@ class BacktestEngine:
                 "DSMO_Slow": round(float(sig_bar.get("DSMO_Slow", 50)), 2),
                 "DSMO_Zone": str(sig_bar.get("DSMO_Zone", "-")),
                 "ADX": round(float(sig_bar.get("ADX", 0)), 2) if not pd.isna(sig_bar.get("ADX")) else 0.0,
+                "Choppiness": round(float(sig_bar.get("choppiness", 0)), 2) if not pd.isna(sig_bar.get("choppiness")) else 0.0,
+                "ADX_Weight": round(float(sig_bar.get("adx_weight", 0)), 4) if not pd.isna(sig_bar.get("adx_weight")) else 0.0,
                 "RawSignal": round(raw_sig, 2),
                 "SmoothSignal": round(smooth_sig, 2),
+                "SignalMomentum": round(signal_mom, 2),
                 "RegimeWeight": round(regime_w, 2),
                 "EffSignal": round(eff_signal, 2),
                 "State": {1: "LONG", 0: "FLAT", -1: "SHORT"}.get(int(sig_bar.get("hysteresis_state", 0)), "FLAT"),

@@ -35,8 +35,8 @@ class BarLogger:
     COLUMNS = [
         "Date", "Close", "Open", "High", "Low", "Volume",
         "AMA", "ATR", "SMFI", "SMFI_Zone", "SMFI_Div",
-        "DSMO_Fast", "DSMO_Slow", "DSMO_Zone", "ADX",
-        "RawSignal", "SmoothSignal", "RegimeWeight", "EffSignal",
+        "DSMO_Fast", "DSMO_Slow", "DSMO_Zone", "ADX", "Choppiness", "ADX_Weight",
+        "RawSignal", "SmoothSignal", "SignalMomentum", "RegimeWeight", "EffSignal",
         "State", "Position", "PositionValue", "Equity", "Cash",
     ]
 
@@ -117,8 +117,8 @@ class TradeLogger:
             f"Notional: ${trade['Notional']:,.2f}\n"
         )
         self.fh.write(
-            f"  Signal: {trade['Signal']} | SMFI: {trade['SMFI']} | "
-            f"RealizedVol: {trade['RealizedVol']}%\n"
+            f"  Signal: {trade.get('Signal', '-')} | SMFI: {trade.get('SMFI', '-')} | "
+            f"RealizedVol: {trade.get('RealizedVol', '-')}%\n"
         )
         self.fh.write(f"  Reason: {trade['Reason']}\n")
 
@@ -131,12 +131,14 @@ class TradeLogger:
             f"Price: {trade['Price']} | Shares: {trade['Shares']} | "
             f"Notional: ${trade['Notional']:,.2f}\n"
         )
-        pnl_sign = "+" if trade["PnL"] >= 0 else ""
+        pnl_sign = "+" if trade.get("PnL", 0) >= 0 else ""
+        pnl = trade.get("PnL", 0)
+        pnl_pct = trade.get("PnL_Pct", 0)
         self.fh.write(
-            f"  PnL: {pnl_sign}${trade['PnL']:,.2f} "
-            f"({pnl_sign}{trade['PnL_Pct']:.2f}%) | "
+            f"  PnL: {pnl_sign}${pnl:,.2f} "
+            f"({pnl_sign}{pnl_pct:.2f}%) | "
             f"Bars Held: {trade.get('BarsHeld', '-')} | "
-            f"Signal: {trade['Signal']} | SMFI: {trade['SMFI']}\n"
+            f"Signal: {trade.get('Signal', '-')} | SMFI: {trade.get('SMFI', '-')}\n"
         )
         self.fh.write(f"  Reason: {trade['Reason']}\n")
 
