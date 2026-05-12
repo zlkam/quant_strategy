@@ -1,0 +1,50 @@
+name: Daily Quant Signal Report
+
+on:
+  schedule:
+    # Mon-Fri at 02:00 UTC (= 10:00 PM ET previous day)
+    # Runs after Yahoo Finance data is updated (~midnight UTC) and delivers
+    # the report ~11 hours before US market open at 9:30 AM ET.
+    - cron: "0 2 * * 1-5"
+  workflow_dispatch:  # allow manual trigger
+
+jobs:
+  daily-signal:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Cache pip dependencies
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: ${{ runner.os }}-pip-${{ hashFiles('requirements.txt') }}
+          restore-keys: |
+            ${{ runner.os }}-pip-
+
+      - name: Install dependencies
+        run: |
+          pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Run daily signal script
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: python daily_signal.py
+
+      - name: Upload daily run log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: daily-run-log
+          path: logs/daily_runs/
+          retention-days: 30

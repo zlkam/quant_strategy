@@ -60,13 +60,22 @@ See `config.py` — all parameters are in five dataclasses:
 ```
 pandas>=1.5.0
 numpy>=1.21.0
+yfinance>=0.2.30
+requests>=2.28.0
 ```
 
 ## Usage
 
+### Backtest
 ```bash
 python main.py
 ```
+
+### Daily Automation
+```bash
+python daily_signal.py
+```
+Runs the signal pipeline on yesterday's closing data and sends a bilingual (EN/ZH) Telegram report.
 
 ### Output
 
@@ -75,3 +84,23 @@ python main.py
 | `logs/<TICKER>_bars.log` | Per-bar indicator values + equity (pipe-delimited) |
 | `logs/<TICKER>_trades.log` | Structured trade blocks with signal context + summary |
 | `logs/portfolio_summary.log` | Combined metrics across all tickers |
+| `logs/daily_runs/run_YYYY-MM-DD.log` | Daily automation signal log |
+
+## GitHub Actions Automation
+
+A workflow runs Mon–Fri at 12:30 UTC (8:30 AM ET, ~1 hour before US market open):
+
+1. Fetches yesterday's OHLCV data from Yahoo Finance
+2. Computes the full signal pipeline for all 9 tickers
+3. Compares against tracked positions
+4. Sends a bilingual Telegram report with actionable signals
+5. Logs the run to `logs/daily_runs/`
+
+### Setup
+
+1. Create a Telegram bot via [@BotFather](https://t.me/BotFather) and get the token
+2. Get your chat ID (send a message to [@userinfobot](https://t.me/userinfobot))
+3. Add to GitHub Secrets:
+   - `TELEGRAM_BOT_TOKEN` — your bot token
+   - `TELEGRAM_CHAT_ID` — your chat ID
+4. Enable the workflow in GitHub Actions tab
