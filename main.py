@@ -20,7 +20,7 @@ from config import BacktestConfig
 from data.loader import load_all_tickers
 from backtest.engine import BacktestEngine
 from backtest.metrics import MetricsCalculator
-from utils.logging import BarLogger, TradeLogger
+from backtest.logging import BarLogger, TradeLogger
 
 
 OUTPUT_DIR = "logs"

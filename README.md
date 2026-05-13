@@ -56,9 +56,10 @@ quant_strategy/
 │   └── cross_validate.py      # Cross-validation vs backtesting.py engine
 ├── automation/                # Scheduled jobs
 │   └── daily_signal.py        # Daily signal pipeline + Telegram report
-├── backtest/                  # Vectorized backtest engine
+├── backtest/                  # Vectorized backtest engine + output
 │   ├── engine.py              # State machine: signal → execution → equity
-│   └── metrics.py             # Sharpe, Sortino, Calmar, hit rates
+│   ├── metrics.py             # Sharpe, Sortino, Calmar, hit rates
+│   └── logging.py             # Bar-level and trade-level log writers
 ├── data/
 │   └── loader.py              # CSV ingestion (handles BOM, M/B/K suffixes)
 ├── indicators/                # Technical indicators
@@ -67,11 +68,15 @@ quant_strategy/
 │   └── smfi.py                # Smart Money Flow Index
 ├── risk/
 │   └── controls.py            # Vol targeting, dynamic stops, TP levels
-├── strategy/
-│   ├── signal.py              # Signal construction, hysteresis, HMM, dynamic weights
-│   └── ml_weights.py          # Rolling-Sharpe weight optimization
-├── utils/
-│   └── logging.py             # Bar-level and trade-level log writers
+├── strategy/                  # Signal pipeline (continuous composite)
+│   ├── adx.py                 # ADX + Choppiness Index
+│   ├── composite.py           # Raw signal, indicator components, smoothing
+│   ├── regime.py              # Binary, sigmoid & dual (ADX+CI) regime gates
+│   ├── hysteresis.py          # Signal momentum, hysteresis state machine
+│   ├── hmm.py                 # HMM regime detection (3-state Gaussian)
+│   ├── dynamic_weights.py     # Grid-search dynamic weight optimization
+│   ├── ml_weights.py          # Rolling-Sharpe + MLP weight predictors
+│   └── signal.py              # Re-export shim (all public API)
 ├── web/                       # Web dashboard (FastAPI + HTML/JS)
 │   ├── server.py              # FastAPI backend serving JSON API
 │   └── static/
