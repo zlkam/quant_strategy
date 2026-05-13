@@ -1,0 +1,289 @@
+/* ================================================================
+   Quant Strategy Dashboard — Dark Theme
+   ================================================================ */
+
+:root {
+  --bg: #0E1117;
+  --bg2: #1A1C23;
+  --bg3: #262730;
+  --text: #FAFAFA;
+  --text2: #CCC;
+  --text3: #888;
+  --green: #00CC66;
+  --red: #FF4444;
+  --orange: #FFA726;
+  --blue: #42A5F5;
+  --purple: #AB47BC;
+  --border: #333;
+  --radius: 8px;
+  --sidebar-w: 260px;
+}
+
+* { box-sizing: border-box; margin: 0; padding: 0; }
+
+body {
+  font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+  background: var(--bg);
+  color: var(--text);
+  display: flex;
+  min-height: 100vh;
+}
+
+/* ---- Sidebar ---- */
+
+#sidebar {
+  width: var(--sidebar-w);
+  min-width: var(--sidebar-w);
+  background: var(--bg2);
+  padding: 16px 14px;
+  border-right: 1px solid var(--border);
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+#sidebar h1 {
+  font-size: 1.15em;
+  color: var(--green);
+  margin-bottom: 0;
+}
+
+#sidebar .subtitle {
+  font-size: 0.72em;
+  color: var(--text3);
+  margin-bottom: 10px;
+}
+
+.control-group {
+  margin-bottom: 6px;
+}
+
+.control-group label {
+  display: block;
+  font-size: 0.72em;
+  color: var(--text3);
+  margin-bottom: 2px;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+}
+
+.control-group select,
+button {
+  width: 100%;
+  padding: 7px 8px;
+  border-radius: var(--radius);
+  border: 1px solid var(--border);
+  background: var(--bg3);
+  color: var(--text);
+  font-size: 0.85em;
+  cursor: pointer;
+}
+
+button {
+  margin-top: 4px;
+  font-weight: 600;
+}
+
+button:hover { background: #333; }
+
+#refresh-btn { background: var(--green); color: #000; border: none; }
+#refresh-btn:hover { opacity: 0.85; }
+
+.divider {
+  height: 1px;
+  background: var(--border);
+  margin: 10px 0;
+}
+
+#sidebar h3 {
+  font-size: 0.85em;
+  color: var(--text3);
+  margin-bottom: 4px;
+}
+
+/* Quick-view ticker buttons */
+#quick-view {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+}
+
+.qv-btn {
+  flex: 1 1 28%;
+  padding: 5px 2px;
+  font-size: 0.72em;
+  border-radius: 4px;
+  border: 1px solid var(--border);
+  background: var(--bg3);
+  color: var(--text2);
+  cursor: pointer;
+  text-align: center;
+  transition: all 0.15s;
+}
+
+.qv-btn:hover { border-color: var(--text3); }
+.qv-btn.active { border-color: var(--green); color: var(--green); font-weight: 700; }
+
+/* Positions */
+#positions-panel {
+  font-size: 0.78em;
+  color: var(--text2);
+}
+
+.pos-item {
+  padding: 4px 6px;
+  margin: 3px 0;
+  border-radius: 4px;
+  background: var(--bg3);
+  font-size: 0.75em;
+  line-height: 1.4;
+}
+
+.pos-item .ticker { font-weight: 700; }
+.pos-item.LONG  { border-left: 3px solid var(--green); }
+.pos-item.SHORT { border-left: 3px solid var(--red); }
+
+/* ---- Main ---- */
+
+#main {
+  flex: 1;
+  padding: 12px 16px;
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.chart-container {
+  background: var(--bg2);
+  border-radius: var(--radius);
+  border: 1px solid var(--border);
+  overflow: hidden;
+}
+
+#chart-price { min-height: 460px; flex: 6; }
+#chart-indicator { min-height: 260px; flex: 4; }
+
+/* ---- Metrics ---- */
+
+.metrics-row {
+  display: flex;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+
+.metric-card {
+  flex: 1 1 100px;
+  background: var(--bg2);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 10px 12px;
+  text-align: center;
+}
+
+.metric-card .label {
+  font-size: 0.68em;
+  color: var(--text3);
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+}
+
+.metric-card .value {
+  font-size: 1.2em;
+  font-weight: 700;
+}
+
+.metric-card .delta {
+  font-size: 0.75em;
+  margin-top: 2px;
+}
+
+.delta.up   { color: var(--green); }
+.delta.down { color: var(--red); }
+
+/* ---- Signal Cards ---- */
+
+.signal-cards {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 8px;
+}
+
+.signal-card {
+  display: block;
+  text-decoration: none;
+  background: var(--bg2);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 10px 12px;
+  cursor: pointer;
+  transition: border-color 0.15s;
+}
+
+.signal-card:hover { border-color: var(--text3); }
+
+.signal-card .top {
+  display: flex;
+  justify-content: space-between;
+  align-items: baseline;
+  margin-bottom: 4px;
+}
+
+.signal-card .ticker-name { font-size: 0.95em; font-weight: 700; color: var(--text); }
+.signal-card .state-badge {
+  font-size: 0.72em;
+  font-weight: 700;
+  padding: 2px 7px;
+  border-radius: 4px;
+}
+
+.state-badge.LONG  { background: rgba(0,204,102,0.18); color: var(--green); }
+.state-badge.SHORT { background: rgba(255,68,68,0.18);  color: var(--red); }
+.state-badge.FLAT  { background: rgba(136,136,136,0.18); color: var(--text3); }
+.state-badge.ERROR { background: rgba(255,68,68,0.18);  color: var(--red); }
+
+.signal-card .sig-row {
+  font-size: 0.82em;
+  color: var(--text2);
+  margin-bottom: 2px;
+}
+
+.signal-card .delta { font-size: 0.72em; opacity: 0.6; }
+.signal-card .thresh {
+  font-size: 0.68em;
+  color: var(--text3);
+  margin-bottom: 4px;
+}
+
+.signal-card .indicators {
+  font-size: 0.68em;
+  color: var(--text3);
+}
+
+/* ---- Status bar ---- */
+
+#status-bar {
+  font-size: 0.7em;
+  color: var(--text3);
+  text-align: center;
+  padding: 4px;
+}
+
+/* ---- Selection highlight on chart ---- */
+
+#chart-price .plotly .main-svg,
+#chart-indicator .plotly .main-svg {
+  border-radius: var(--radius);
+}
+
+/* ---- Loading ---- */
+
+.loading {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  height: 100%;
+  color: var(--text3);
+  font-size: 0.9em;
+}

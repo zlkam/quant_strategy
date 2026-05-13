@@ -1,6 +1,8 @@
 from .signal import (
     compute_adx,
     compute_raw_signal,
+    compute_indicator_components,
+    compute_weighted_signal,
     smooth_signal,
     compute_choppiness_index,
     compute_regime_weight,
@@ -9,11 +11,16 @@ from .signal import (
     compute_signal_momentum,
     compute_effective_signal,
     compute_hysteresis_state,
+    compute_hmm_regime,
+    compute_dynamic_weights,
+    compute_hmm_effective_signal,
 )
 
 __all__ = [
     "compute_adx",
     "compute_raw_signal",
+    "compute_indicator_components",
+    "compute_weighted_signal",
     "smooth_signal",
     "compute_choppiness_index",
     "compute_regime_weight",
@@ -22,4 +29,7 @@ __all__ = [
     "compute_signal_momentum",
     "compute_effective_signal",
     "compute_hysteresis_state",
+    "compute_hmm_regime",
+    "compute_dynamic_weights",
+    "compute_hmm_effective_signal",
 ]

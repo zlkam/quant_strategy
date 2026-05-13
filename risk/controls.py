@@ -94,42 +94,72 @@ class RiskManager:
     # Dynamic Trailing Stop (SMFI-gated)
     # ------------------------------------------------------------------
 
-    def get_stop_multiplier(self, smfi_value: float) -> float:
+    def get_stop_multiplier(
+        self,
+        smfi_value: float,
+        is_long: bool = True,
+        eff_signal: float = 50.0,
+    ) -> float:
         """
-        Return the ATR multiplier for the trailing stop based on SMFI zone.
+        Return the ATR multiplier for the trailing stop.
 
-        SMFI > 60 (accumulation): 3.0x ATR → wider stop, let winners compound.
-            Smart money is actively accumulating, so temporary drawdowns
-            are likely to be bought — giving the trade room prevents
-            premature exits during normal pullbacks.
-        SMFI < 40 (distribution): 1.0x ATR → tighter stop, cut fast.
-            Smart money is distributing — the trend is likely to fail.
-            Tightening the stop preserves capital.
-        SMFI 40–60 (neutral): 2.0x ATR → standard stop.
-            Industry-standard 2x ATR for swing trading on daily bars.
+        SMFI-gated (unchanged from before):
+          SMFI > 60 (accumulation): wider stop — let winners compound.
+          SMFI < 40 (distribution): tighter stop — cut fast.
+          SMFI 40–60 (neutral): standard stop.
+
+        Short-specific (improvement #2):
+          Shorts use a tighter base stop (1.5x vs 2.0x) because equity
+          markets have upward drift — short losses compound faster.
+
+        Signal-strength adaptive (improvement #3):
+          When conviction is strong (|eff_signal| > 70), widen the stop
+          by 25% to give strong trends more room. When conviction is
+          weak (|eff_signal| < 30), tighten by 25%.
 
         Parameters
         ----------
         smfi_value : float
             Current SMFI reading.
+        is_long : bool, default True
+            True for long positions, False for short.
+        eff_signal : float, default 50.0
+            Absolute effective signal strength for adaptive adjustment.
 
         Returns
         -------
         float
             ATR multiplier for stop distance.
         """
+        # Base multiplier from SMFI zone
         if smfi_value > 60.0:
-            return self.cfg.atr_accumulation
+            mult = self.cfg.atr_accumulation
         elif smfi_value < 40.0:
-            return self.cfg.atr_distribution
-        return self.cfg.atr_base
+            mult = self.cfg.atr_distribution
+        else:
+            mult = self.cfg.atr_base
+
+        # Short positions get tighter base stop (equity drift asymmetry)
+        if not is_long:
+            mult = min(mult, self.cfg.atr_short)
+
+        # Signal-strength adaptive adjustment (improvement #3)
+        if self.cfg.stop_signal_adaptive:
+            abs_sig = abs(eff_signal)
+            if abs_sig > 70.0:
+                mult *= 1.25   # strong conviction — give more room
+            elif abs_sig < 30.0:
+                mult *= 0.75   # weak conviction — tighten
+
+        return max(mult, 0.5)  # floor at 0.5x ATR
 
     def compute_stop_level(
         self,
         reference_price: float,
         atr: float,
         smfi_value: float,
-        is_long: bool,
+        is_long: bool = True,
+        eff_signal: float = 50.0,
     ) -> float:
         """
         Compute the trailing stop level.
@@ -137,9 +167,7 @@ class RiskManager:
         For longs:  stop = highest_close_since_entry - multiplier * ATR
         For shorts: stop = lowest_close_since_entry  + multiplier * ATR
 
-        The reference price for longs is the highest close since entry;
-        for shorts it's the lowest close since entry. Both are updated
-        each bar by the engine.
+        The multiplier is SMFI-gated, short-specific, and signal-adaptive.
 
         Parameters
         ----------
@@ -149,15 +177,17 @@ class RiskManager:
             Current ATR value.
         smfi_value : float
             Current SMFI reading — determines stop width.
-        is_long : bool
+        is_long : bool, default True
             True for long positions, False for short.
+        eff_signal : float, default 50.0
+            Effective signal strength — wider stop when conviction is strong.
 
         Returns
         -------
         float
             Stop price level.
         """
-        multiplier = self.get_stop_multiplier(smfi_value)
+        multiplier = self.get_stop_multiplier(smfi_value, is_long=is_long, eff_signal=eff_signal)
         distance = multiplier * atr
 
         if is_long:
@@ -173,25 +203,21 @@ class RiskManager:
         entry_price: float,
         entry_atr: float,
         is_long: bool,
+        adx: float = 20.0,
     ) -> list[dict]:
         """
         Compute locked profit target levels at entry.
 
         Each target is a dict: {price, fraction_to_sell, label}
-        Prices are ATR-multiples from the entry price, locked at entry
-        to prevent dynamic recalculation mid-trade (avoids backtest-to-live
-        divergence from shifting ATR).
+        Prices are ATR-multiples from the entry price, locked at entry.
+
+        ADX-adaptive (improvement #3):
+          When ADX > 30 (strong trend), TP levels are widened by tp_adx_boost
+          (default 1.5x) to capture trend extensions without prematurely
+          exiting winners. In weak trends (ADX < 20), base levels apply.
 
         For longs:  TP = entry_price + level * entry_ATR
         For shorts: TP = entry_price - level * entry_ATR
-
-        The remaining fraction (1 - sum of all tp_fractions) is left to
-        trail with the dynamic stop.
-
-        Research basis (trustdan 293-backtest study):
-        Multi-stage profit targets with ATR-based levels consistently
-        outperform trailing-only exits by capturing trend extensions
-        without premature exits.
 
         Parameters
         ----------
@@ -201,19 +227,23 @@ class RiskManager:
             ATR value at entry bar (locked, not dynamic).
         is_long : bool
             True for long positions, False for short.
+        adx : float, default 20.0
+            ADX value at entry — determines whether to widen TP levels.
 
         Returns
         -------
         list[dict]
             Sorted list of {price, fraction, label} dicts.
-            For longs: sorted ascending (closest TP first).
-            For shorts: sorted descending (closest TP first).
         """
         if not self.cfg.tp_enabled:
             return []
 
-        levels = self.cfg.tp_levels
-        fractions = self.cfg.tp_fractions
+        levels = list(self.cfg.tp_levels)
+        fractions = list(self.cfg.tp_fractions)
+
+        # ADX-adaptive TP widening: in strong trends, push targets further out
+        if self.cfg.tp_adx_adaptive and adx > 30.0:
+            levels = [l * self.cfg.tp_adx_boost for l in levels]
 
         targets = []
         for i, (level, frac) in enumerate(zip(levels, fractions)):
@@ -225,7 +255,7 @@ class RiskManager:
                 "price": round(tp_price, 4),
                 "fraction": frac,
                 "filled": False,
-                "label": f"TP{level}N",
+                "label": f"TP{level:.0f}N",
             })
 
         # Sort: longs closest TP first, shorts closest TP first

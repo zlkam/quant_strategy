@@ -12,6 +12,9 @@ __pycache__/
 *.pyc
 *.pyo
 
+# Virtual environment (uv)
+.venv/
+
 # IDE
 .vscode/
 .idea/

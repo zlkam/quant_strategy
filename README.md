@@ -2,105 +2,194 @@
 
 Multi-indicator directional strategy combining AMA (trend), SMFI (flow), and DSMO (momentum) into a continuous composite signal supporting LONG / FLAT / SHORT positioning with volatility-targeted sizing and dynamic trailing stops.
 
+## Live Dashboard
+
+```bash
+uv run python web/server.py
+# or: uv run uvicorn web.server:app --host 0.0.0.0 --port 8501
+```
+
+Opens at **http://localhost:8501**. FastAPI backend serves the HTML/JS frontend
+and a JSON API. The frontend uses Plotly.js for candlestick + indicator charts
+with pan/zoom, signal cards, position tracker, and auto-refresh.
+
+Deploy for free on [Render](https://render.com) or [Railway](https://railway.app)
+— see [Deployment](#deployment).
+
 ## Strategy Logic
 
 ### Signal Pipeline
 
 ```
-Indicators → Raw Signal [-100,+100] → EMA(3) → ADX Regime Gate → Hysteresis → Position
+Indicators → Raw Signal [-100,+100] → EMA(3) → ADX/HMM Regime Gate → Hysteresis → Position
 ```
 
-1. **AMA** measures trend direction via adaptive smoothing — the directional backbone
-2. **SMFI** detects institutional capital flow via volume analysis — confirms or dampens
-3. **DSMO** provides momentum timing via triple-smoothed stochastic — refines entries/exits
+1. **AMA** — trend direction via adaptive smoothing
+2. **SMFI** — institutional capital flow via volume analysis
+3. **DSMO** — momentum timing via triple-smoothed stochastic
 
 ### Execution
 
 - **LONG entry**: Smoothed, regime-gated signal crosses above +40
 - **LONG exit**: Signal crosses below +15 (or trailing stop hit)
-- **SHORT entry**: Signal crosses below -40
-- **SHORT cover**: Signal crosses above -15 (or trailing stop hit)
+- **SHORT entry**: Signal crosses below -50
+- **SHORT cover**: Signal crosses above -20 (or trailing stop hit)
 
 25-point hysteresis gap prevents whipsaw.
 
 ### Risk Controls
 
 - **Position sizing**: Volatility-targeted — larger in low vol, smaller in high vol
-- **Trailing stops**: SMFI-gated — wider during accumulation (let winners run), tighter during distribution (cut fast)
-- **Regime filter**: ADX(14) keeps strategy flat in ranging markets
+- **Trailing stops**: SMFI-gated — wider during accumulation, tighter during distribution
+- **Regime filter**: HMM + ADX complementary blend keeps strategy flat in ranging markets
 - **DD circuit breakers**: 15% max DD for ETFs, 25% for stocks
 
 ## Project Structure
 
 ```
 quant_strategy/
-├── config.py              # All tuneable parameters
-├── main.py                # Entry point
-├── strategy/              # Signal construction + hysteresis
-├── backtest/              # Engine + metrics
-├── risk/                  # Position sizing + stops
-├── indicators/            # AMA, SMFI, DSMO
-├── data/                  # CSV loader
-├── utils/                 # .log output
-├── historical_data/       # Input CSVs
-└── logs/                  # Output logs
+├── .github/workflows/         # CI/CD
+│   └── daily_signal.yml       # Mon-Fri automated signal run
+├── analysis/                  # Research & validation tools
+│   ├── audit.py               # Strategy audit: scenario analysis, peer comparison
+│   ├── optimize.py            # Walk-forward parameter optimization
+│   └── cross_validate.py      # Cross-validation vs backtesting.py engine
+├── automation/                # Scheduled jobs
+│   └── daily_signal.py        # Daily signal pipeline + Telegram report
+├── backtest/                  # Vectorized backtest engine
+│   ├── engine.py              # State machine: signal → execution → equity
+│   └── metrics.py             # Sharpe, Sortino, Calmar, hit rates
+├── data/
+│   └── loader.py              # CSV ingestion (handles BOM, M/B/K suffixes)
+├── indicators/                # Technical indicators
+│   ├── ama.py                 # Adaptive Moving Average
+│   ├── dsmo.py                # Double Smoothed Momentum Oscillator
+│   └── smfi.py                # Smart Money Flow Index
+├── risk/
+│   └── controls.py            # Vol targeting, dynamic stops, TP levels
+├── strategy/
+│   ├── signal.py              # Signal construction, hysteresis, HMM, dynamic weights
+│   └── ml_weights.py          # Rolling-Sharpe weight optimization
+├── utils/
+│   └── logging.py             # Bar-level and trade-level log writers
+├── web/                       # Web dashboard (FastAPI + HTML/JS)
+│   ├── server.py              # FastAPI backend serving JSON API
+│   └── static/
+│       ├── index.html         # Frontend layout
+│       ├── style.css          # Dark theme
+│       └── app.js             # Plotly.js charts + interactivity
+├── config.py                  # All tuneable parameters (5 dataclasses)
+├── main.py                    # Backtest entry point
+├── pyproject.toml             # uv project config + dependencies
+└── README.md
 ```
 
 ## Parameters
 
-See `config.py` — all parameters are in five dataclasses:
+See `config.py` — all parameters in five dataclasses:
 - `IndicatorConfig` — lookback windows and thresholds
-- `SignalConfig` — continuous weights, smoothing, hysteresis thresholds
-- `RegimeConfig` — ADX zone multipliers
+- `SignalConfig` — weights, smoothing, hysteresis thresholds
+- `RegimeConfig` — ADX/HMM blending, CI gate
 - `RiskConfig` — vol targeting, dynamic stops, DD limits
 - `BacktestConfig` — top-level orchestrator
 
-## Requirements
+## Setup
 
+### Install uv (fast Python package manager)
+
+```bash
+pip install uv          # or: curl -LsSf https://astral.sh/uv/install.sh | sh
 ```
-pandas>=1.5.0
-numpy>=1.21.0
-yfinance>=0.2.30
-requests>=2.28.0
+
+### Sync dependencies
+
+```bash
+uv sync                 # creates .venv + installs all packages
 ```
+
+All dependencies are declared in `pyproject.toml` and locked in `uv.lock`.
 
 ## Usage
 
 ### Backtest
+
 ```bash
-python main.py
+uv run python main.py
 ```
+
+
+### Parameter Optimization
+
+```bash
+uv run python analysis/optimize.py                    # all tickers
+uv run python analysis/optimize.py --ticker QQQ       # single ticker
+uv run python analysis/optimize.py --metric calmar    # score by Calmar ratio
+uv run python analysis/optimize.py --fast             # reduced grid for quick runs
+```
+
+Best parameters saved to `logs/optimal_params.json`.
+
+### Cross-Validation
+
+```bash
+uv run python analysis/cross_validate.py              # all tickers
+uv run python analysis/cross_validate.py --ticker QQQ # single ticker
+```
+
+Compares our vectorized engine against `backtesting.py` (event-driven).
+
+### Strategy Audit
+
+```bash
+uv run python analysis/audit.py
+```
+
+Runs 8-regime scenario analysis, peer comparison (B&H, 200-d MA, 60/40), and live-trading readiness checks.
 
 ### Daily Automation
+
 ```bash
-python daily_signal.py
+uv run python automation/daily_signal.py
 ```
-Runs the signal pipeline on yesterday's closing data and sends a bilingual (EN/ZH) Telegram report.
 
-### Output
+Runs the signal pipeline on yesterday's closing data and sends a bilingual (EN/ZH) Telegram report via GitHub Actions.
 
-| File | Content |
-|------|---------|
-| `logs/<TICKER>_bars.log` | Per-bar indicator values + equity (pipe-delimited) |
-| `logs/<TICKER>_trades.log` | Structured trade blocks with signal context + summary |
-| `logs/portfolio_summary.log` | Combined metrics across all tickers |
-| `logs/daily_runs/run_YYYY-MM-DD.log` | Daily automation signal log |
+## Deployment
 
-## GitHub Actions Automation
+### Web Dashboard (free)
 
-A workflow runs Mon–Fri at 12:30 UTC (8:30 AM ET, ~1 hour before US market open):
+**Render** (easiest):
+1. Push to GitHub
+2. Go to [render.com](https://render.com) → New Web Service
+3. Connect repo, set:
+   - **Build command**: `pip install uv && uv sync`
+   - **Start command**: `uv run uvicorn web.server:app --host 0.0.0.0 --port $PORT`
+4. Deploy — live at `https://your-app.onrender.com`
 
-1. Fetches yesterday's OHLCV data from Yahoo Finance
-2. Computes the full signal pipeline for all 9 tickers
-3. Compares against tracked positions
-4. Sends a bilingual Telegram report with actionable signals
-5. Logs the run to `logs/daily_runs/`
+**Railway** ([railway.app](https://railway.app)):
+1. Push to GitHub
+2. New project → Deploy from GitHub
+3. Set start command: `uv run uvicorn web.server:app --host 0.0.0.0 --port $PORT`
+4. Deploy
 
-### Setup
+### GitHub Actions (daily signal)
 
-1. Create a Telegram bot via [@BotFather](https://t.me/BotFather) and get the token
-2. Get your chat ID (send a message to [@userinfobot](https://t.me/userinfobot))
+The workflow at `.github/workflows/daily_signal.yml` runs Mon–Fri at 02:00 UTC.
+
+**Setup:**
+1. Create a Telegram bot via [@BotFather](https://t.me/BotFather)
+2. Get your chat ID from [@userinfobot](https://t.me/userinfobot)
 3. Add to GitHub Secrets:
    - `TELEGRAM_BOT_TOKEN` — your bot token
    - `TELEGRAM_CHAT_ID` — your chat ID
-4. Enable the workflow in GitHub Actions tab
+
+## Output
+
+| File | Content |
+|------|---------|
+| `logs/<TICKER>_bars.log` | Per-bar indicator values + equity |
+| `logs/<TICKER>_trades.log` | Structured trade blocks with summary |
+| `logs/portfolio_summary.log` | Combined metrics across all tickers |
+| `logs/daily_runs/run_YYYY-MM-DD.log` | Daily automation signal log |
+| `logs/audit_report.log` | Strategy audit results |
+| `logs/wfo_results.json` | Walk-forward optimization results |

@@ -63,12 +63,17 @@ class IndicatorConfig:
     adx_transition_low: float = 15.0     # below this → ranging regime
 
     # --- Choppiness Index (structural regime filter) ---
-    # Complements ADX: measures whether price is trending or choppy
-    # regardless of direction. CI > 61.8 = choppy/sideways (Fibonacci ratio).
-    # CI < 38.2 = strongly trending.
-    # Reference: E.W. Dreiss, "The Choppiness Index" (1992)
     ci_period: int = 14
     ci_choppy_threshold: float = 61.8    # above this → market is choppy/ranging
+
+    # --- HMM Regime Detection (improvement #6) ---
+    # Hidden Markov Model for probabilistic 3-regime classification.
+    # Replaces ADX+CI binary gating with soft, transition-aware detection.
+    # Research: HMM regime detection + MPT boosted SPY Sharpe 0.53→0.79.
+    hmm_enabled: bool = True             # True = use HMM, False = fallback to ADX+CI
+    hmm_lookback: int = 504              # rolling window for HMM training (2 years)
+    hmm_retrain_freq: int = 63           # retrain HMM every N bars (~1 quarter)
+    hmm_n_components: int = 3            # bull / bear / ranging
 
 
 # ---------------------------------------------------------------------------
@@ -99,9 +104,25 @@ class SignalConfig:
     """
 
     # Continuous signal weights (contribution to raw_signal in [-100, +100])
+    # When dynamic_weights=True, these are starting values only — they get
+    # overridden each bar by rolling Sharpe-optimized weights.
     ama_weight: float = 0.45
     smfi_weight: float = 0.35
     dsmo_weight: float = 0.20
+
+    # --- Dynamic signal weighting (improvement #7) ---
+    # Three weight methods: "fixed" (default 0.45/0.35/0.20), "grid" (rolling
+    # Sharpe-optimized grid search), "mlp" (neural network predictor).
+    # Research: Deep Momentum Networks — dynamic weights beat fixed by +110% Sharpe.
+    dynamic_weights: bool = True         # True = use weight_method, False = fixed
+    weight_method: str = "grid"           # "fixed" | "grid" | "rolling_sharpe"
+    dw_lookback: int = 252               # rolling window for weight optimization
+    dw_min_weight: float = 0.15          # floor per indicator (prevents zeroing out)
+    # MLP-specific (weight_method="mlp")
+    mlp_train_lookback: int = 504        # training window in bars (~2 years)
+    mlp_retrain_freq: int = 63           # retrain every N bars (~1 quarter)
+    mlp_lr: float = 0.002               # learning rate
+    mlp_seed: int = 42                   # random seed for reproducibility
 
     # EMA smoothing applied to raw_signal to dampen single-bar spikes.
     # 3 bars is the sweet spot: 1 bar = too jittery, 5 bars = excessive lag.
@@ -110,8 +131,15 @@ class SignalConfig:
     # Hysteresis state machine thresholds (effective signal range is [-100, +100])
     long_entry: float = 40.0       # cross above → enter long
     long_exit: float = 15.0        # cross below → exit long
-    short_entry: float = -40.0     # cross below → enter short
-    short_exit: float = -15.0      # cross above → exit (cover) short
+    short_entry: float = -50.0     # cross below → enter short
+    short_exit: float = -20.0      # cross above → cover short
+
+    # --- Short-side quality filters (improvement #2) ---
+    # Shorts underperform longs in equities due to upward drift.
+    # These filters ensure we only short in high-conviction bearish regimes.
+    short_require_adx: bool = True     # require ADX > 20 for short entry (must be trending)
+    short_require_smfi: bool = True    # require SMFI < 45 for short entry (distribution zone)
+    short_smfi_max: float = 45.0       # SMFI must be below this to confirm distribution
 
     # --- Signal momentum filter (improvement #2) ---
     # Enter only when conviction is BUILDING (rising for long, falling for short).
@@ -125,8 +153,8 @@ class SignalConfig:
     # Scale into positions rather than all-in at first signal.
     # Alt26 strategy (trustdan): pyramiding delivered +33.5% on SPY.
     # Only the initial fraction is deployed at first entry.
-    pyramid_initial: float = 0.70      # 70% of target position at first entry
-    pyramid_add: float = 0.30          # 30% for second layer (single add to reach 100%)
+    pyramid_initial: float = 1.00      # 100% of target at first entry (no pyramiding)
+    pyramid_add: float = 0.0           # no additional layers
     pyramid_signal_boost: float = 8.0  # signal must improve by this many points
     pyramid_max_bars: int = 30         # within this many bars to add a layer
 
@@ -171,6 +199,15 @@ class RegimeConfig:
     ci_choppy_threshold: float = 75.0  # above this → market is choppy → reduce exposure (further relaxed)
     ci_gate_enabled: bool = True       # False → revert to ADX-only filter
 
+    # --- HMM Regime Detection (improvement #6) ---
+    # Uses hmmlearn GaussianHMM for probabilistic 3-state classification.
+    # Regime weights are continuous probabilities, not binary gates.
+    use_hmm: bool = True               # True = HMM regime, False = ADX sigmoid + CI
+    # HMM regime → position scaling (multipliers per detected regime)
+    hmm_bull_weight: float = 1.0       # full exposure in bull regime
+    hmm_bear_weight: float = 1.0       # full exposure in bear regime (for shorts)
+    hmm_ranging_weight: float = 0.0    # flat in ranging (same as ADX ranging)
+
 
 # ---------------------------------------------------------------------------
 # Risk Management
@@ -202,15 +239,24 @@ class RiskConfig:
     initial_capital: float = 1_000_000.0
 
     # Volatility targeting
-    target_vol_annual: float = 0.20     # 20% annualized target vol (increased from 15%)
+    target_vol_annual: float = 0.20     # 20% annualized target vol
     vol_lookback: int = 20              # bars for realized vol computation
-    max_exposure: float = 1.5           # cap long exposure at 150% (modest leverage)
-    min_exposure: float = -1.5          # cap short exposure at 150%
+    max_exposure: float = 1.0           # cap long exposure at 100% (no leverage)
+    min_exposure: float = -1.0          # cap short exposure at 100% (no leverage)
 
     # Dynamic trailing stop ATR multipliers (SMFI-gated)
     atr_accumulation: float = 3.0       # SMFI > 60 — let winners run
     atr_base: float = 2.0               # SMFI 40-60 — standard
     atr_distribution: float = 1.0       # SMFI < 40 — cut fast
+    atr_short: float = 1.5              # tighter base stop for shorts (equity drift asymmetry)
+
+    # --- Dynamic exit adaptation (improvement #3) ---
+    tp_adx_adaptive: bool = True        # adapt TP levels to ADX strength
+    tp_adx_boost: float = 1.5           # multiply TP levels by this when ADX > 30
+    stop_signal_adaptive: bool = True   # widen stop when conviction is strong
+    time_exit_enabled: bool = True      # exit if position stagnates
+    time_exit_bars: int = 30            # max bars with < 1% cumulative return
+    time_exit_min_return: float = 0.01  # minimum return over time_exit_bars to stay in
 
     # --- Multi-stage profit targets (improvement #1) ---
     # At entry, lock ATR-based take-profit levels. Sell fractions at each.

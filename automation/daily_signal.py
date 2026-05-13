@@ -6,7 +6,7 @@ pipeline for all configured tickers, compares against tracked positions, and
 sends a bilingual (EN/ZH) actionable report via Telegram Bot API.
 
 Designed to run via GitHub Actions (M-F, 2am UTC) but also executable locally:
-    python daily_signal.py
+    uv run python automation/daily_signal.py
 
 Environment variables (set in GitHub Secrets):
     TELEGRAM_BOT_TOKEN   — Telegram Bot API token
@@ -19,6 +19,9 @@ import sys
 import time
 from datetime import datetime, timedelta
 from pathlib import Path
+
+# Find project root (parent of automation/)
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import numpy as np
 import pandas as pd

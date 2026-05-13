@@ -20,6 +20,8 @@ from indicators import calculate_ama, calculate_dsmo, calculate_smfi
 from strategy.signal import (
     compute_adx,
     compute_raw_signal,
+    compute_indicator_components,
+    compute_weighted_signal,
     smooth_signal,
     compute_choppiness_index,
     compute_regime_weight,
@@ -28,7 +30,11 @@ from strategy.signal import (
     compute_signal_momentum,
     compute_effective_signal,
     compute_hysteresis_state,
+    compute_hmm_regime,
+    compute_dynamic_weights,
+    compute_hmm_effective_signal,
 )
+from strategy.ml_weights import compute_mlp_weights, compute_rolling_sharpe_weights
 from risk.controls import RiskManager
 
 
@@ -152,28 +158,76 @@ class BacktestEngine:
         """
         Build the full signal pipeline and append columns to df.
 
-        Columns added:
-          raw_signal, smoothed_signal, adx_weight, regime_weight,
-          effective_signal, signal_momentum, hysteresis_state
+        Supports two paths:
+          HMM mode (use_hmm=True):
+            HMM regime → effective_signal → hysteresis
+          ADX mode (use_hmm=False):
+            ADX sigmoid + CI → effective_signal → hysteresis
+
+        Also supports dynamic signal weights (rolling Sharpe-optimized).
         """
         sc = self.sig_cfg
         rc = self.reg_cfg
+        ic = self.ind_cfg
 
-        # Continuous raw signal from indicator components
-        df["raw_signal"] = compute_raw_signal(
-            df,
-            ama_w=sc.ama_weight,
-            smfi_w=sc.smfi_weight,
-            dsmo_w=sc.dsmo_weight,
-        )
+        # --- Dynamic weights (improvement #7) ---
+        # Two-step pipeline: extract per-bar components → optimize weights → combine
+        if sc.dynamic_weights:
+            # Step 1: Extract per-bar indicator components
+            components = compute_indicator_components(df)
+
+            # Step 2: Compute weights using chosen method
+            if sc.weight_method == "grid":
+                dw_df = compute_dynamic_weights(
+                    components, df,
+                    lookback=sc.dw_lookback,
+                    min_weight=sc.dw_min_weight,
+                )
+            elif sc.weight_method == "rolling_sharpe":
+                dw_df = compute_rolling_sharpe_weights(
+                    components, df,
+                    lookback=sc.dw_lookback,
+                    min_weight=sc.dw_min_weight,
+                )
+            else:  # "mlp" or other → fallback to rolling sharpe
+                dw_df = compute_mlp_weights(
+                    components, df,
+                    train_lookback=sc.mlp_train_lookback,
+                    retrain_freq=sc.mlp_retrain_freq,
+                    min_weight=sc.dw_min_weight,
+                    seed=sc.mlp_seed,
+                )
+
+            # Step 3: Combine with per-bar dynamic weights
+            # For each bar, use its optimized weight to compute the signal.
+            # compute_weighted_signal uses fixed weights — we compute bar-by-bar.
+            ama_c = components["ama_component"].values
+            smfi_c = components["smfi_component"].values
+            dsmo_c = components["dsmo_component"].values
+            raw_arr = (dw_df["ama_w"].values * ama_c
+                       + dw_df["smfi_w"].values * smfi_c
+                       + dw_df["dsmo_w"].values * dsmo_c) * 100.0
+            df["raw_signal"] = pd.Series(raw_arr, index=df.index)
+
+            # Store dynamic weight series for logging
+            df["dyn_ama_w"] = dw_df["ama_w"].values
+            df["dyn_smfi_w"] = dw_df["smfi_w"].values
+            df["dyn_dsmo_w"] = dw_df["dsmo_w"].values
+        else:
+            df["raw_signal"] = compute_raw_signal(
+                df,
+                ama_w=sc.ama_weight,
+                smfi_w=sc.smfi_weight,
+                dsmo_w=sc.dsmo_weight,
+            )
 
         # EMA smoothing to dampen single-bar whipsaws
         df["smoothed_signal"] = smooth_signal(
             df["raw_signal"], period=sc.signal_ema_period
         )
 
-        # Sigmoid ADX weight (improvement #5) — smooth continuous blending
-        # or fall back to binary 3-zone if use_sigmoid=False in config
+        # --- Regime detection (improvement #6: HMM + ADX blend) ---
+        # Always compute ADX sigmoid (lightweight, always available)
         if rc.use_sigmoid:
             df["adx_weight"] = compute_sigmoid_regime_weight(
                 df["ADX"],
@@ -184,20 +238,37 @@ class BacktestEngine:
         else:
             df["adx_weight"] = compute_regime_weight(
                 df["ADX"],
-                trend_threshold=self.ind_cfg.adx_trend_threshold,
-                transition_low=self.ind_cfg.adx_transition_low,
+                trend_threshold=ic.adx_trend_threshold,
+                transition_low=ic.adx_transition_low,
                 trending_weight=rc.trending_weight,
                 transitional_weight=rc.transitional_weight,
                 ranging_weight=rc.ranging_weight,
             )
 
-        # Dual regime gate: ADX sigmoid + Choppiness Index (improvement #3)
+        # Base regime = ADX sigmoid + CI gate
         df["regime_weight"] = compute_dual_regime_weight(
             df["adx_weight"],
             df["choppiness"],
             ci_threshold=rc.ci_choppy_threshold,
             ci_enabled=rc.ci_gate_enabled,
         )
+
+        # If HMM enabled, blend with ADX+CI (take max — complementary filter)
+        if rc.use_hmm and ic.hmm_enabled:
+            hmm_regime = compute_hmm_regime(
+                df,
+                lookback=ic.hmm_lookback,
+                retrain_freq=ic.hmm_retrain_freq,
+                n_components=ic.hmm_n_components,
+            )
+            # Blend: take the MAX of both regime weights.
+            # HMM catches return-distribution regimes that ADX misses (e.g.,
+            # low-ADX bull runs). ADX catches trending strength that HMM
+            # misses (e.g., short but sharp trends). The max ensures neither
+            # filter alone can block a genuine opportunity.
+            df["regime_weight"] = np.maximum(df["regime_weight"].values, hmm_regime)
+            # Store HMM separately for logging
+            df["hmm_weight"] = hmm_regime
 
         # Effective signal = smoothed × regime weight
         df["effective_signal"] = compute_effective_signal(
@@ -255,6 +326,8 @@ class BacktestEngine:
         entry_bar_idx = 0           # bar index of initial entry for time window
         target_shares = 0.0         # full target position size from vol-targeted sizing
         is_long_pos = True          # direction of current position
+        entry_equity = 0.0          # equity at position entry (for time-based exit)
+        rc = self.config.risk       # shorthand for risk config
 
         # Multi-stage TP state (improvement #1)
         tp_targets: list[dict] = []  # list of {price, fraction, filled, label}
@@ -290,6 +363,7 @@ class BacktestEngine:
             hyst_state = int(sig_bar.get("hysteresis_state", 0))
             smfi_val = float(sig_bar.get("SMFI", 50.0))
             atr_val = float(sig_bar.get("ATR", 0.0))
+            adx_val = float(sig_bar.get("ADX", 0.0)) if not pd.isna(sig_bar.get("ADX")) else 0.0
             vol = float(realized_vol.iloc[i - 1]) if i - 1 < len(realized_vol) else 0.20
 
             # --- State machine execution ---
@@ -327,10 +401,11 @@ class BacktestEngine:
                     pyramid_count = 0
                     last_pyramid_signal = abs(eff_signal)
                     target_shares = sh_target
+                    entry_equity = cash + shares * exec_open
 
-                    # Locked TP targets at entry (improvement #1)
+                    # Locked TP targets at entry (ADX-adaptive, improvement #3)
                     tp_targets = self.risk_mgr.compute_profit_targets(
-                        exec_open, atr_val, is_long=True
+                        exec_open, atr_val, is_long=True, adx=adx_val
                     )
 
                     trade_action = {
@@ -352,46 +427,60 @@ class BacktestEngine:
                     trades.append(trade_action)
 
                 elif hyst_state == -1 and mom_ok and sh_target < 0:
-                    # Enter SHORT — pyramid initial fraction
-                    entry_fraction = sc.pyramid_initial
-                    sh = sh_target * abs(entry_fraction)  # sh_target is negative, sh stays negative
-                    # Actually sh_target is negative, fraction is positive. Need careful handling.
-                    sh = sh_target * entry_fraction  # e.g., -1000 * 0.5 = -500
-                    notional = abs(sh) * exec_open
-                    short_proceeds = abs(sh) * exec_open
-                    cash += short_proceeds
-                    shares = sh
-                    avg_entry_price = exec_open
-                    reference_price = exec_close
-                    bars_in_position = 0
-                    is_long_pos = False
-                    entry_bar_idx = i
-                    pyramid_count = 0
-                    last_pyramid_signal = abs(eff_signal)
-                    target_shares = sh_target
-
-                    # Locked TP targets at entry (improvement #1)
-                    tp_targets = self.risk_mgr.compute_profit_targets(
-                        exec_open, atr_val, is_long=False
+                    # Short quality filters (improvement #2):
+                    # Equities drift up — only short in confirmed bearish regimes.
+                    # ADX > 20: trend must be present (not ranging)
+                    # SMFI < 45: smart money must be distributing (not neutral/accumulating)
+                    short_adx_ok = (
+                        not sc.short_require_adx or adx_val >= self.ind_cfg.adx_trend_threshold
+                    )
+                    short_smfi_ok = (
+                        not sc.short_require_smfi or smfi_val < sc.short_smfi_max
                     )
 
-                    trade_action = {
-                        "Date": exec_date,
-                        "Ticker": ticker,
-                        "Action": "SELL_SHORT",
-                        "Price": round(exec_open, 4),
-                        "Shares": round(shares, 4),
-                        "Notional": round(short_proceeds, 2),
-                        "Signal": round(eff_signal, 2),
-                        "SignalMom": round(signal_mom, 2),
-                        "SMFI": round(smfi_val, 2),
-                        "RealizedVol": round(vol * 100, 2),
-                        "PnL": 0.0,
-                        "PnL_Pct": 0.0,
-                        "Pyramid": "1/3",
-                        "Reason": f"short entry (signal={eff_signal:.1f}, mom={signal_mom:+.1f})",
-                    }
-                    trades.append(trade_action)
+                    if short_adx_ok and short_smfi_ok:
+                        # Enter SHORT — pyramid initial fraction
+                        entry_fraction = sc.pyramid_initial
+                        sh = sh_target * entry_fraction
+                        notional = abs(sh) * exec_open
+                        short_proceeds = abs(sh) * exec_open
+                        cash += short_proceeds
+                        shares = sh
+                        avg_entry_price = exec_open
+                        reference_price = exec_close
+                        bars_in_position = 0
+                        is_long_pos = False
+                        entry_bar_idx = i
+                        pyramid_count = 0
+                        last_pyramid_signal = abs(eff_signal)
+                        target_shares = sh_target
+                        entry_equity = cash + shares * exec_open
+
+                        # Locked TP targets at entry (ADX-adaptive, improvement #3)
+                        tp_targets = self.risk_mgr.compute_profit_targets(
+                            exec_open, atr_val, is_long=False, adx=adx_val
+                        )
+
+                        short_gate_info = ""
+                        if sc.short_require_adx or sc.short_require_smfi:
+                            short_gate_info = f", adx={adx_val:.1f}, smfi={smfi_val:.1f}"
+                        trade_action = {
+                            "Date": exec_date,
+                            "Ticker": ticker,
+                            "Action": "SELL_SHORT",
+                            "Price": round(exec_open, 4),
+                            "Shares": round(shares, 4),
+                            "Notional": round(short_proceeds, 2),
+                            "Signal": round(eff_signal, 2),
+                            "SignalMom": round(signal_mom, 2),
+                            "SMFI": round(smfi_val, 2),
+                            "RealizedVol": round(vol * 100, 2),
+                            "PnL": 0.0,
+                            "PnL_Pct": 0.0,
+                            "Pyramid": "1/3",
+                            "Reason": f"short entry (signal={eff_signal:.1f}, mom={signal_mom:+.1f}{short_gate_info})",
+                        }
+                        trades.append(trade_action)
 
             elif shares > 0:
                 # ---- LONG position ----
@@ -460,6 +549,9 @@ class BacktestEngine:
                             / (shares + add_shares)
                         )
                         shares += add_shares
+                        # Clamp to target size — no leverage allowed
+                        if target_shares != 0 and abs(shares) > abs(target_shares):
+                            shares = target_shares
                         pyramid_count += 1
                         last_pyramid_signal = abs(eff_signal)
                         layer_label = f"{pyramid_count + 1}/3"
@@ -479,10 +571,32 @@ class BacktestEngine:
                             "Reason": f"pyramid add (signal improved to {abs(eff_signal):.1f}, +{abs(eff_signal)-last_pyramid_signal+sc.pyramid_signal_boost:.1f}pts)",
                         })
 
+                # --- Time-based exit for stagnant LONG (improvement #3) ---
+                if shares > 0 and rc.time_exit_enabled and bars_in_position >= rc.time_exit_bars:
+                    current_eq = cash + shares * exec_close
+                    cum_return = (current_eq - entry_equity) / entry_equity if entry_equity > 0 else 0
+                    if abs(cum_return) < rc.time_exit_min_return:
+                        exit_notional = shares * exec_open
+                        cash += exit_notional
+                        pnl = exit_notional - shares * avg_entry_price
+                        pnl_pct = (exec_open - avg_entry_price) / avg_entry_price * 100 if avg_entry_price > 0 else 0
+                        trades.append({
+                            "Date": exec_date, "Ticker": ticker, "Action": "SELL",
+                            "Price": round(exec_open, 4), "Shares": round(shares, 4),
+                            "Notional": round(exit_notional, 2),
+                            "Signal": round(eff_signal, 2), "SMFI": round(smfi_val, 2),
+                            "PnL": round(pnl, 2), "PnL_Pct": round(pnl_pct, 4),
+                            "BarsHeld": bars_in_position, "Tier": "TIME",
+                            "Reason": f"time exit — stagnant ({cum_return*100:.2f}% in {bars_in_position} bars)",
+                        })
+                        trade_action = trades[-1]
+                        shares = 0.0; avg_entry_price = 0.0; reference_price = 0.0
+                        bars_in_position = 0; tp_targets = []
+
                 # --- Exit conditions (stop / reversal / hysteresis) ---
                 if shares > 0:
                     stop_level = self.risk_mgr.compute_stop_level(
-                        reference_price, atr_val, smfi_val, is_long=True
+                        reference_price, atr_val, smfi_val, is_long=True, eff_signal=eff_signal
                     )
                     stop_hit = exec_close <= stop_level and atr_val > 0
 
@@ -601,6 +715,9 @@ class BacktestEngine:
                             / (abs(shares) + abs(add_shares))
                         )
                         shares += add_shares  # more negative
+                        # Clamp to target size — no leverage allowed
+                        if target_shares != 0 and abs(shares) > abs(target_shares):
+                            shares = target_shares
                         pyramid_count += 1
                         last_pyramid_signal = abs(eff_signal)
                         layer_label = f"{pyramid_count + 1}/3"
@@ -620,10 +737,33 @@ class BacktestEngine:
                             "Reason": f"pyramid add short (signal improved to {abs(eff_signal):.1f})",
                         })
 
+                # --- Time-based exit for stagnant SHORT (improvement #3) ---
+                if shares < 0 and rc.time_exit_enabled and bars_in_position >= rc.time_exit_bars:
+                    current_eq = cash + shares * exec_close
+                    cum_return = (current_eq - entry_equity) / entry_equity if entry_equity > 0 else 0
+                    if abs(cum_return) < rc.time_exit_min_return:
+                        cover_shares = abs(shares)
+                        cover_cost = cover_shares * exec_open
+                        cash -= cover_cost
+                        pnl = abs(shares) * avg_entry_price - cover_cost
+                        pnl_pct = (avg_entry_price - exec_open) / avg_entry_price * 100 if avg_entry_price > 0 else 0
+                        trades.append({
+                            "Date": exec_date, "Ticker": ticker, "Action": "BUY_TO_COVER",
+                            "Price": round(exec_open, 4), "Shares": round(cover_shares, 4),
+                            "Notional": round(cover_cost, 2),
+                            "Signal": round(eff_signal, 2), "SMFI": round(smfi_val, 2),
+                            "PnL": round(pnl, 2), "PnL_Pct": round(pnl_pct, 4),
+                            "BarsHeld": bars_in_position, "Tier": "TIME",
+                            "Reason": f"time exit — stagnant ({cum_return*100:.2f}% in {bars_in_position} bars)",
+                        })
+                        trade_action = trades[-1]
+                        shares = 0.0; avg_entry_price = 0.0; reference_price = 0.0
+                        bars_in_position = 0; tp_targets = []
+
                 # --- Cover conditions (stop / reversal / hysteresis) ---
                 if shares < 0:
                     stop_level = self.risk_mgr.compute_stop_level(
-                        reference_price, atr_val, smfi_val, is_long=False
+                        reference_price, atr_val, smfi_val, is_long=False, eff_signal=eff_signal
                     )
                     stop_hit = exec_close >= stop_level and atr_val > 0
 

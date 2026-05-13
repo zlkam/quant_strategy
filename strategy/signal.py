@@ -1,17 +1,12 @@
 """
 Continuous signal construction from AMA, SMFI, and DSMO indicator outputs.
 
-Replaces the old binary checklist (0/1 per indicator, capped at 100) with
-intensity-scaled contributions in [-100, +100] that capture *how strong*
-each signal is, not just whether it fired.
-
-Also provides ADX computation, EMA smoothing, regime gating, and a
-hysteresis state machine for LONG / FLAT / SHORT positioning.
+Includes ADX, Choppiness Index, HMM regime detection, dynamic signal
+weighting, sigmoid blending, and a hysteresis state machine.
 """
 
 import numpy as np
 import pandas as pd
-
 from config import SignalConfig, RegimeConfig
 
 
@@ -197,8 +192,104 @@ def compute_raw_signal(
 
 
 # ---------------------------------------------------------------------------
-# Signal Smoothing
+# Per-Indicator Component Extraction (Phase A)
 # ---------------------------------------------------------------------------
+
+def compute_indicator_components(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Extract the per-bar, unweighted indicator components for dynamic weighting.
+
+    Returns a DataFrame with columns:
+      ama_component  — AMA trend strength, tanh-bounded to [-1, +1]
+      smfi_component — SMFI flow conviction, tanh-bounded to [-1, +1]
+      dsmo_component — DSMO momentum position, tanh-bounded to [-1, +1]
+
+    These components are the building blocks that get weighted and summed
+    to produce the composite signal. By exposing them, dynamic weighting
+    can optimize per-bar indicator contributions without re-extraction.
+
+    The computations match those in compute_raw_signal() exactly — this
+    function just separates the extraction from the weighted combination.
+
+    Parameters
+    ----------
+    df : pd.DataFrame
+        Must contain: 'AMA', 'ATR', 'SMFI', 'SMFI_Div', 'DSMO_Fast', 'DSMO_Slow'.
+
+    Returns
+    -------
+    pd.DataFrame
+        Columns: ama_component, smfi_component, dsmo_component.
+        Index matches df.index.
+    """
+    # ---- AMA trend strength ----
+    ama = df["AMA"]
+    atr = df["ATR"]
+    ama_trend = (ama - ama.shift(5)) / atr.clip(lower=1e-10)
+    ama_comp = np.tanh(ama_trend)
+
+    # ---- SMFI flow conviction ----
+    smfi = df["SMFI"]
+    smfi_div = df.get("SMFI_Div", pd.Series(0.0, index=df.index))
+    smfi_dev = (smfi - 50.0) / 25.0
+    div_mod = np.ones(len(df))
+    div_mod[smfi_div == 1.0] = 1.5
+    div_mod[smfi_div == -1.0] = 0.5
+    smfi_comp = np.tanh(smfi_dev * div_mod)
+
+    # ---- DSMO momentum position ----
+    dsmo_fast = df["DSMO_Fast"]
+    dsmo_slow = df["DSMO_Slow"]
+    dsmo_pos = (dsmo_fast - 50.0) / 30.0
+    golden_cross = (dsmo_fast.shift(1) < dsmo_slow.shift(1)) & (dsmo_fast > dsmo_slow)
+    death_cross = (dsmo_fast.shift(1) > dsmo_slow.shift(1)) & (dsmo_fast < dsmo_slow)
+    cross_boost = np.zeros(len(df))
+    cross_boost[golden_cross] = 0.5
+    cross_boost[death_cross] = -0.5
+    dsmo_comp = np.tanh(dsmo_pos + cross_boost)
+
+    return pd.DataFrame({
+        "ama_component": ama_comp,
+        "smfi_component": smfi_comp,
+        "dsmo_component": dsmo_comp,
+    }, index=df.index)
+
+
+# ---------------------------------------------------------------------------
+# Weighted Signal Combination (Phase A)
+# ---------------------------------------------------------------------------
+
+def compute_weighted_signal(
+    components: pd.DataFrame,
+    ama_w: float = 0.45,
+    smfi_w: float = 0.35,
+    dsmo_w: float = 0.20,
+) -> pd.Series:
+    """
+    Combine per-bar indicator components with weights into a composite signal.
+
+    signal = (ama_w * ama_component + smfi_w * smfi_component
+              + dsmo_w * dsmo_component) * 100.0
+
+    The result is in [-100, +100]. Positive = bullish, negative = bearish.
+
+    Parameters
+    ----------
+    components : pd.DataFrame
+        From compute_indicator_components(). Must have columns:
+        ama_component, smfi_component, dsmo_component.
+    ama_w, smfi_w, dsmo_w : float
+        Weights (should sum to ~1.0 for interpretability).
+
+    Returns
+    -------
+    pd.Series
+        Weighted composite signal in [-100, +100].
+    """
+    raw = (ama_w * components["ama_component"].values
+           + smfi_w * components["smfi_component"].values
+           + dsmo_w * components["dsmo_component"].values) * 100.0
+    return pd.Series(raw, index=components.index)
 
 def smooth_signal(raw_signal: pd.Series, period: int = 3) -> pd.Series:
     """
@@ -612,3 +703,277 @@ def compute_hysteresis_state(
         prev_signal = curr_signal
 
     return state
+
+
+# ---------------------------------------------------------------------------
+# HMM Regime Detection (Improvement #6)
+# ---------------------------------------------------------------------------
+
+def compute_hmm_regime(
+    df: pd.DataFrame,
+    lookback: int = 252,
+    retrain_freq: int = 21,
+    n_components: int = 3,
+    random_state: int = 42,
+) -> np.ndarray:
+    """
+    Detect market regimes using a rolling Hidden Markov Model.
+
+    Trains a GaussianHMM on log-returns and volume every retrain_freq bars
+    using a rolling lookback window. Outputs a continuous regime weight
+    for each bar in [0, 1] representing how "trend-friendly" the regime is.
+
+    Three regimes are detected (ordered by mean return):
+      - Regime 0 (highest return): Bull trend → weight = 1.0
+      - Regime 1 (middle):        Transitional / weak trend → weight = 0.5
+      - Regime 2 (lowest):        Bear / ranging → weight = 0.0 (or bear exposure)
+
+    Unlike ADX which only measures trend strength, HMM captures the full
+    return distribution structure — including volatility clustering and
+    regime persistence — providing smoother, less whipsaw-prone signals.
+
+    Research basis: HMM regime detection + MPT allocation boosted SPY
+    Sharpe from 0.53 to 0.79 (bspreston10, 2024).
+
+    Parameters
+    ----------
+    df : pd.DataFrame
+        Must contain 'Close' and 'Volume'.
+    lookback : int, default 252
+        Rolling window (bars) for HMM training (~1 year of daily data).
+    retrain_freq : int, default 21
+        Retrain HMM every N bars to balance responsiveness vs compute cost.
+    n_components : int, default 3
+        Number of hidden states (bull / transition / bear-ranging).
+    random_state : int, default 42
+        Seed for reproducible HMM initialization.
+
+    Returns
+    -------
+    np.ndarray
+        Regime weight in [0, 1] per bar. 1.0 = bull-trend, 0.5 = transition,
+        0.0 = bear/ranging. First (lookback) bars return 0.5 (neutral).
+    """
+    try:
+        from hmmlearn.hmm import GaussianHMM
+    except ImportError:
+        print("WARNING: hmmlearn not installed. Falling back to neutral HMM weight.")
+        return np.full(len(df), 0.5)
+
+    close = df["Close"].values
+    volume = df["Volume"].values
+
+    # Features: log returns + volume change (standardized)
+    log_ret = np.diff(np.log(np.maximum(close, 1e-10)), prepend=np.nan)
+    log_ret[0] = 0.0
+    vol_change = np.diff(volume, prepend=0) / (volume + 1)
+    vol_change[0] = 0.0
+
+    # Stack features and drop NaN
+    features = np.column_stack([log_ret, vol_change])
+    features = np.nan_to_num(features, nan=0.0)
+
+    n = len(df)
+    hmm_weight = np.full(n, 0.5)  # default: neutral
+
+    if n < lookback + 10:
+        return hmm_weight  # not enough data
+
+    # Rolling HMM: retrain every retrain_freq bars, predict forward
+    last_state_probs = None
+    for start in range(0, n - lookback, retrain_freq):
+        train_end = start + lookback
+        if train_end > n:
+            break
+
+        train_data = features[start:train_end]
+
+        # Standardize training window
+        tr_mean = np.mean(train_data, axis=0)
+        tr_std = np.std(train_data, axis=0).clip(min=1e-8)
+        train_norm = (train_data - tr_mean) / tr_std
+
+        try:
+            import warnings
+            with warnings.catch_warnings():
+                warnings.filterwarnings("ignore", category=UserWarning)
+                model = GaussianHMM(
+                    n_components=n_components,
+                    covariance_type="full",
+                    n_iter=1000,
+                    random_state=random_state,
+                    tol=1e-4,
+                    init_params="stmc",  # initialize all params
+                )
+                model.fit(train_norm)
+
+            # Predict regime for the training window
+            states = model.predict(train_norm)
+            state_means = []
+            for s in range(n_components):
+                mask = states == s
+                if mask.sum() > 0:
+                    state_means.append(log_ret[start:train_end][mask].mean())
+                else:
+                    state_means.append(0.0)
+
+            # Order regimes by mean return: highest = bull
+            regime_order = np.argsort(state_means)  # ascending
+            # regime_order[0] = lowest return (bear/ranging) → weight 0.0
+            # regime_order[1] = middle (transitional) → weight 0.5
+            # regime_order[2] = highest return (bull) → weight 1.0
+
+            # Predict forward from train_end to min(n, next retrain point)
+            predict_end = min(start + lookback + retrain_freq, n)
+            predict_data = features[train_end:predict_end]
+            if len(predict_data) > 0:
+                predict_norm = (predict_data - tr_mean) / tr_std
+                pred_states = model.predict(predict_norm)
+
+                for j, s in enumerate(pred_states):
+                    idx = train_end + j
+                    if idx >= n:
+                        break
+                    rank = np.where(regime_order == s)[0][0]
+                    if rank == 2:
+                        hmm_weight[idx] = 1.0   # bull → full exposure
+                    elif rank == 1:
+                        hmm_weight[idx] = 0.5   # transitional → half
+                    else:
+                        hmm_weight[idx] = 0.0   # bear/ranging → flat
+
+        except Exception:
+            # HMM fit failed (e.g., singular covariance) — keep neutral
+            pass
+
+    return hmm_weight
+
+
+# ---------------------------------------------------------------------------
+# Dynamic Signal Weights (Improvement #7)
+# ---------------------------------------------------------------------------
+
+def compute_dynamic_weights(
+    components: pd.DataFrame,
+    df: pd.DataFrame,
+    lookback: int = 252,
+    min_weight: float = 0.15,
+) -> pd.DataFrame:
+    """
+    Compute rolling Sharpe-optimized per-bar indicator weights.
+
+    Uses true per-component data for accurate optimization: for each bar,
+    evaluates all weight combinations over a rolling window, scoring by
+    the Sharpe ratio of: (weighted_signal) × (next_bar_return).
+
+    Parameters
+    ----------
+    components : pd.DataFrame
+        From compute_indicator_components(). Must have columns:
+        ama_component, smfi_component, dsmo_component.
+    df : pd.DataFrame
+        Must contain 'Close' for forward returns computation.
+    lookback : int, default 252
+        Rolling window for weight optimization.
+    min_weight : float, default 0.15
+        Floor per indicator weight.
+
+    Returns
+    -------
+    pd.DataFrame
+        Columns: ama_w, smfi_w, dsmo_w — optimized weights per bar.
+        First (lookback) bars use default 0.45/0.35/0.20.
+    """
+    n = len(components)
+    close = df["Close"].values
+
+    # Default weights for warmup period
+    ama_w_arr = np.full(n, 0.45)
+    smfi_w_arr = np.full(n, 0.35)
+    dsmo_w_arr = np.full(n, 0.20)
+
+    if n < lookback + 20:
+        return pd.DataFrame({
+            "ama_w": ama_w_arr, "smfi_w": smfi_w_arr, "dsmo_w": dsmo_w_arr,
+        }, index=components.index)
+
+    # Get component arrays
+    ama_c = components["ama_component"].values
+    smfi_c = components["smfi_component"].values
+    dsmo_c = components["dsmo_component"].values
+
+    # Forward returns: bar t's signal predicts bar t+1's return
+    fwd_ret = np.zeros(n)
+    ret = np.diff(close) / np.maximum(close[:-1], 1e-10)
+    fwd_ret[:len(ret)] = ret  # fwd_ret[t] = return from t to t+1
+
+    # Weight grid: step 0.05, each >= min_weight, sum to 1.0
+    weight_steps = np.arange(min_weight, 1.0 - 2 * min_weight + 0.005, 0.05)
+    weight_combos = [(wa, ws, 1.0 - wa - ws)
+                     for wa in weight_steps
+                     for ws in weight_steps
+                     if 1.0 - wa - ws >= min_weight]
+
+    if not weight_combos:
+        weight_combos = [(0.45, 0.35, 0.20)]
+
+    # Pre-compute weighted signals for all combos (n × k matrix)
+    # weighted_signal[t, c] = wa[c]*ama[t] + ws[c]*smfi[t] + wd[c]*dsmo[t]
+    n_combos = len(weight_combos)
+    weighted_signals = np.zeros((n, n_combos))
+    for c, (wa, ws, wd) in enumerate(weight_combos):
+        weighted_signals[:, c] = (wa * ama_c + ws * smfi_c + wd * dsmo_c)
+
+    # Rolling optimization: for each bar, find best weights over lookback window
+    sqrt252 = np.sqrt(252)
+    for i in range(lookback, n):
+        start = max(0, i - lookback)
+        sig_slice = weighted_signals[start:i, :]  # (window, n_combos)
+        ret_slice = fwd_ret[start:i]              # (window,)
+
+        # Strategy return for each combo: signal * fwd_return
+        # We use sign(signal) * return (directional), not raw signal * return
+        strat_rets = np.sign(sig_slice) * ret_slice[:, np.newaxis]  # (window, n_combos)
+        mu = np.mean(strat_rets, axis=0)       # (n_combos,)
+        sigma = np.std(strat_rets, axis=0)      # (n_combos,)
+        sigma = np.maximum(sigma, 1e-8)
+        sharpes = mu / sigma * sqrt252          # (n_combos,)
+
+        best_idx = np.argmax(sharpes)
+        ama_w_arr[i] = weight_combos[best_idx][0]
+        smfi_w_arr[i] = weight_combos[best_idx][1]
+        dsmo_w_arr[i] = weight_combos[best_idx][2]
+
+    return pd.DataFrame({
+        "ama_w": ama_w_arr, "smfi_w": smfi_w_arr, "dsmo_w": dsmo_w_arr,
+    }, index=components.index)
+
+
+# ---------------------------------------------------------------------------
+# HMM-Aware Effective Signal
+# ---------------------------------------------------------------------------
+
+def compute_hmm_effective_signal(
+    smoothed_signal: pd.Series,
+    hmm_weight: np.ndarray,
+) -> pd.Series:
+    """
+    Apply HMM regime weight to the smoothed signal.
+
+    Unlike the ADX sigmoid which gates only on trend strength, HMM weight
+    captures the full return distribution regime. Bull regime (1.0) gives
+    full signal, transitional (0.5) halves it, bear/ranging (0.0) flattens.
+
+    Parameters
+    ----------
+    smoothed_signal : pd.Series
+        EMA-smoothed raw signal.
+    hmm_weight : np.ndarray
+        HMM regime weights from compute_hmm_regime().
+
+    Returns
+    -------
+    pd.Series
+        Effective signal in [-100, +100].
+    """
+    return smoothed_signal * pd.Series(hmm_weight, index=smoothed_signal.index)
