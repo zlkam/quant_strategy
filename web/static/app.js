@@ -873,7 +873,29 @@ function bindEvents() {
 
 	$("#toggle-cards-btn").addEventListener("click", toggleSignalCards);
 
+	$("#lang-toggle").addEventListener("click", function (e) {
+		e.stopPropagation(); // don't toggle the <details>
+		toggleLanguage();
+	});
+
 	window.addEventListener("resize", adjustChartSize);
+}
+
+// ---- Language Toggle ----
+
+function toggleLanguage() {
+	const guide = $("#guide-content");
+	const label = $("#lang-label");
+	if (!guide || !label) return;
+	if (guide.classList.contains("guide-cn")) {
+		guide.classList.remove("guide-cn");
+		guide.classList.add("guide-en");
+		label.textContent = "中文";
+	} else {
+		guide.classList.remove("guide-en");
+		guide.classList.add("guide-cn");
+		label.textContent = "English";
+	}
 }
 
 // ---- Toggle Signal Cards ----

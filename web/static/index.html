@@ -73,6 +73,31 @@
   <div class="divider"></div>
   <h3>Positions</h3>
   <div id="positions-panel"></div>
+
+  <div class="divider"></div>
+  <details id="signal-guide" open>
+    <summary><h3>Signal Guide / <span id="lang-label">中文</span></h3><button id="lang-toggle" class="lang-btn" title="Toggle EN/中文">EN/CN</button></summary>
+    <div class="guide-content guide-en" id="guide-content">
+
+
+      <p class="en"><b>Signal</b> &mdash; composite score [-100,+100] from AMA, SMFI &amp; DSMO, gated by regime filter. Positive = bullish, negative = bearish.</p>
+      <p class="cn"><b>Signal</b> &mdash; 综合评分[-100,+100]，由AMA、SMFI、DSMO加权合成，经市场状态过滤。正值看涨，负值看跌。</p>
+      <p class="en"><b>L&gt;40/15</b> &mdash; LONG entry when signal crosses above 40, exit when falls below 15 (hysteresis).</p>
+      <p class="cn"><b>L&gt;40/15</b> &mdash; 做多入场：信号上穿40；做多离场：信号下穿15（滞后阈值）。</p>
+      <p class="en"><b>S&lt;-50/-20</b> &mdash; SHORT entry when signal crosses below -50, exit when rises above -20.</p>
+      <p class="cn"><b>S&lt;-50/-20</b> &mdash; 做空入场：信号下穿-50；做空离场：信号上穿-20。</p>
+      <p class="en"><b>ADX</b> &mdash; Avg Directional Index. Trend strength; &gt;20 = trending, &lt;20 = ranging.</p>
+      <p class="cn"><b>ADX</b> &mdash; 平均趋向指数。趋势强度：&gt;20有趋势，&lt;20震荡。</p>
+      <p class="en"><b>SMFI</b> &mdash; Smart Money Flow Index. Volume-based institutional flow; &gt;60 accumulation, &lt;40 distribution.</p>
+      <p class="cn"><b>SMFI</b> &mdash; 聪明钱流向指数。基于成交量的机构资金流：&gt;60吸筹，&lt;40派发。</p>
+      <p class="en"><b>CI</b> &mdash; Choppiness Index. Market structure; &gt;61.8 choppy, &lt;38.2 trending.</p>
+      <p class="cn"><b>CI</b> &mdash; 震荡指数。市场结构：&gt;61.8震荡，&lt;38.2趋势。</p>
+      <p class="en"><b>AMA</b> &mdash; Adaptive Moving Avg. Trend line on price chart; adapts speed to momentum.</p>
+      <p class="cn"><b>AMA</b> &mdash; 自适应移动平均线。价格图上的趋势线，速度随动量自适应调整。</p>
+      <p class="en"><b>ATR</b> &mdash; Avg True Range. Volatility measure used for stop &amp; target levels.</p>
+      <p class="cn"><b>ATR</b> &mdash; 平均真实波幅。波动率指标，用于计算止损和止盈位。</p>
+    </div>
+  </details>
 </aside>
 
 <!-- Main -->
