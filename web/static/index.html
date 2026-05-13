@@ -4,15 +4,38 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>Quant Strategy Dashboard</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Chakra+Petch:wght@400;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
 <link rel="stylesheet" href="/static/style.css">
 <script src="https://cdn.plot.ly/plotly-3.1.0.min.js"></script>
 </head>
 <body>
 
+<div id="grid-bg"></div>
+<div id="noise-overlay"></div>
+
+<!-- Top Bar -->
+<header id="top-bar">
+  <div class="tb-left">
+    <span class="logo">Q<span class="logo-accent">/</span>S</span>
+    <span class="tb-title">quant strategy</span>
+  </div>
+  <div id="status-bar" class="tb-center"></div>
+  <div class="tb-right">
+    <button id="toggle-cards-btn" class="tb-toggle" title="Show/Hide Ticker Cards">Cards</button>
+    <div id="update-pulse" class="pulse-dot"></div>
+    <span id="update-time" class="tb-time"></span>
+  </div>
+</header>
+
+<div id="app-shell">
 <!-- Sidebar -->
 <aside id="sidebar">
-  <h1>Quant Strategy</h1>
-  <p class="subtitle">AMA + SMFI + DSMO</p>
+  <div class="sb-brand">
+    <h1>Quant<span class="brand-accent">Strategy</span></h1>
+    <p class="subtitle">AMA &middot; SMFI &middot; DSMO</p>
+  </div>
 
   <div class="control-group">
     <label for="ticker-select">Primary Ticker</label>
@@ -28,16 +51,6 @@
       <option value="120">120</option>
       <option value="180">180</option>
       <option value="250">250</option>
-    </select>
-  </div>
-
-  <div class="control-group">
-    <label for="period-select">Data Depth</label>
-    <select id="period-select">
-      <option value="3mo" selected>3 months</option>
-      <option value="6mo">6 months</option>
-      <option value="1y">1 year</option>
-      <option value="2y">2 years</option>
     </select>
   </div>
 
@@ -64,16 +77,13 @@
 
 <!-- Main -->
 <main id="main">
-  <!-- Candlestick chart -->
-  <div id="chart-price" class="chart-container"></div>
-  <!-- Indicator chart -->
-  <div id="chart-indicator" class="chart-container"></div>
-  <!-- Metrics -->
+  <section id="chart-area">
+    <div id="chart-price" class="chart-container"></div>
+  </section>
   <div id="metrics-row" class="metrics-row"></div>
-  <!-- Signal cards -->
   <div id="signal-cards" class="signal-cards"></div>
-  <div id="status-bar"></div>
 </main>
+</div>
 
 <script src="/static/app.js"></script>
 </body>
