@@ -2,10 +2,9 @@ name: Daily Quant Signal Report
 
 on:
   schedule:
-    # Mon-Fri at 02:00 UTC (= 10:00 PM ET previous day)
+    # Mon-Fri at 07:00 UTC
     # Runs after Yahoo Finance data is updated (~midnight UTC) and delivers
-    # the report ~11 hours before US market open at 9:30 AM ET.
-    - cron: "0 2 * * 1-5"
+    - cron: "0 7 * * 1-5"
   workflow_dispatch:  # allow manual trigger
 
 jobs:
