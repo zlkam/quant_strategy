@@ -179,7 +179,8 @@ Runs the signal pipeline on yesterday's closing data and sends a bilingual (EN/Z
 
 ### GitHub Actions (daily signal)
 
-The workflow at `.github/workflows/daily_signal.yml` runs Mon–Fri at 02:00 UTC.
+The workflow at `.github/workflows/daily_signal.yml` runs Mon–Fri at 07:00 UTC. (By right is 03:00 US Eastern Time, but there is an approximately 4 hours delay in timing, ended up workflow runs at 07:00 US Eastern Time.
+If timing works fine, you may adjust to 11:00 UTC)
 
 **Setup:**
 1. Create a Telegram bot via [@BotFather](https://t.me/BotFather)
