@@ -490,6 +490,16 @@ def format_telegram_message(
     lines.append(f"📅 {today} ({weekday})")
     lines.append("")
 
+    # --- All Signals Overview ---
+    lines.append("📡 MARKET SIGNALS | 市场信号")
+    for a in actions:
+        if a.get("action") == "ERROR":
+            lines.append(f"❌ {a['ticker']:<5} | ERROR")
+        else:
+            emoji = STATE_EMOJI.get(a["signal_state"], "⚪")
+            lines.append(f"{emoji} {a['ticker']:<5} | Sig: {a['effective_signal']:+.1f}")
+    lines.append("")
+
     # --- Summary of changes ---
     opens = [a for a in actions if a['action'] in ('BUY', 'SELL_SHORT')]
     closes = [a for a in actions if a['action'] in ('SELL', 'COVER')]
@@ -510,7 +520,7 @@ def format_telegram_message(
 
     # --- Actionable signals table ---
     lines.append("━" * 30)
-    lines.append("📈 SIGNALS | 信号")
+    lines.append("📈 ACTIONABLE | 操作信号")
     lines.append("━" * 30)
 
     # Group by action type
@@ -567,9 +577,10 @@ def format_telegram_message(
     if active_positions:
         for ticker, pos in active_positions.items():
             emoji = STATE_EMOJI.get(pos["state"], "⚪")
+            sig_val = signals.get(ticker, {}).get("effective_signal", 0.0)
             lines.append(
-                f"{emoji} {ticker:<6} | {pos['state']:<6} | "
-                f"Entry: {pos.get('entry_price', '-')} | Stop: {pos.get('stop_level', '-')}"
+                f"{emoji} {ticker:<5} | {pos['state']:<5} | Sig: {sig_val:+.1f}\n"
+                f"   Entry: {pos.get('entry_price', '-')} | Stop: {pos.get('stop_level', '-')}"
             )
     else:
         lines.append("No active positions | 无持仓")
