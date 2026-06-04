@@ -490,16 +490,6 @@ def format_telegram_message(
     lines.append(f"📅 {today} ({weekday})")
     lines.append("")
 
-    # --- All Signals Overview ---
-    lines.append("📡 MARKET SIGNALS | 市场信号")
-    for a in actions:
-        if a.get("action") == "ERROR":
-            lines.append(f"❌ {a['ticker']:<5} | ERROR")
-        else:
-            emoji = STATE_EMOJI.get(a["signal_state"], "⚪")
-            lines.append(f"{emoji} {a['ticker']:<5} | Sig: {a['effective_signal']:+.1f}")
-    lines.append("")
-
     # --- Summary of changes ---
     opens = [a for a in actions if a['action'] in ('BUY', 'SELL_SHORT')]
     closes = [a for a in actions if a['action'] in ('SELL', 'COVER')]
@@ -518,55 +508,36 @@ def format_telegram_message(
                 lines.append(f"  🔄 Reverse {a['ticker']} to {a['signal_state']} | {a['ticker']} {a['action_cn']}")
         lines.append("")
 
-    # --- Actionable signals table ---
     lines.append("━" * 30)
-    lines.append("📈 ACTIONABLE | 操作信号")
+    lines.append("📈 SIGNALS & ACTIONS | 信号与操作")
     lines.append("━" * 30)
 
-    # Group by action type
-    urgent_actions = [
-        "BUY", "SELL_SHORT", "SELL", "COVER",
-        "REVERSE_TO_LONG", "REVERSE_TO_SHORT"
-    ]
-    hold_actions = ["HOLD", "HOLD_CASH", "RAISE_STOP", "LOWER_STOP"]
+    for a in actions:
+        if a.get("action") == "ERROR":
+            lines.append(f"❌ {a['ticker']:<5} | ERROR")
+            continue
 
-    # Init / first-run setup is no longer shown in the report
+        ticker = a["ticker"]
+        eff_sig = a["effective_signal"]
+        prev_sig = a.get("prev_effective_signal", eff_sig)
+        diff = eff_sig - prev_sig
 
-    # Urgent actions first
-    urgent = [a for a in actions if a["action"] in urgent_actions]
-    hold = [a for a in actions if a["action"] in hold_actions]
+        act_str = a["action"]
+        if act_str == "HOLD_CASH":
+            act_str = "CASH"
+        elif act_str == "SELL_SHORT":
+            act_str = "SHORT"
+        elif act_str == "REVERSE_TO_LONG":
+            act_str = "REV LONG"
+        elif act_str == "REVERSE_TO_SHORT":
+            act_str = "REV SHORT"
 
-    if not urgent and not hold:
-        lines.append("No actionable signals today | 今日无操作信号")
-        lines.append("")
+        emoji = STATE_EMOJI.get(a["signal_state"], "⚪")
+        lines.append(f"{emoji} {ticker:<5} | Sig: {eff_sig:>+5.1f} | Dif: {diff:>+5.1f} | {act_str}")
 
-    if urgent:
-        for a in urgent:
-            emoji = STATE_EMOJI.get(a["signal_state"], "⚪")
-            lines.append(
-                f"{emoji} {a['ticker']:<6} | {a['action']:<18} | {a['action_cn']}"
-            )
-            lines.append(
-                f"   Close: {a['close']:<10} Signal: {a['effective_signal']:+.1f}"
-            )
-            lines.append(
-                f"   {a['conviction_str']:<20} | {a['regime_str']}"
-            )
+        # Append trade details (entry/stop info) only for active changes
+        if a["action"] not in ("HOLD", "HOLD_CASH"):
             lines.append(f"   → {a['details']}")
-            lines.append("")
-
-    # Hold/stable positions (condensed)
-    if hold:
-        lines.append("━" * 30)
-        lines.append("📋 HOLDING | 持仓不变")
-        lines.append("━" * 30)
-        for a in hold:
-            emoji = STATE_EMOJI.get(a["current_state"], "⚪")
-            short_action = a["action"].replace("_", " ").title()
-            lines.append(
-                f"{emoji} {a['ticker']:<6} | {short_action:<14} | "
-                f"{a['action_cn']:<10} | Sig: {a['effective_signal']:+.1f}"
-            )
 
     # --- Current positions summary ---
     lines.append("")
@@ -577,9 +548,8 @@ def format_telegram_message(
     if active_positions:
         for ticker, pos in active_positions.items():
             emoji = STATE_EMOJI.get(pos["state"], "⚪")
-            sig_val = signals.get(ticker, {}).get("effective_signal", 0.0)
             lines.append(
-                f"{emoji} {ticker:<5} | {pos['state']:<5} | Sig: {sig_val:+.1f}\n"
+                f"{emoji} {ticker:<5} | {pos['state']:<5}\n"
                 f"   Entry: {pos.get('entry_price', '-')} | Stop: {pos.get('stop_level', '-')}"
             )
     else:
