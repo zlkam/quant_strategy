@@ -524,6 +524,12 @@ def format_telegram_message(
 
     # Urgent actions first
     urgent = [a for a in actions if a["action"] in urgent_actions]
+    hold = [a for a in actions if a["action"] in hold_actions]
+
+    if not urgent and not hold:
+        lines.append("No actionable signals today | 今日无操作信号")
+        lines.append("")
+
     if urgent:
         for a in urgent:
             emoji = STATE_EMOJI.get(a["signal_state"], "⚪")
@@ -540,7 +546,6 @@ def format_telegram_message(
             lines.append("")
 
     # Hold/stable positions (condensed)
-    hold = [a for a in actions if a["action"] in hold_actions]
     if hold:
         lines.append("━" * 30)
         lines.append("📋 HOLDING | 持仓不变")
