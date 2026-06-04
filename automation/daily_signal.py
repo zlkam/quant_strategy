@@ -184,8 +184,10 @@ def compute_current_signals() -> dict[str, dict]:
 
             # Get last bar's signal state
             last = df.iloc[-1]
+            prev = df.iloc[-2] if len(df) > 1 else last
             hyst_state = int(last.get("hysteresis_state", 0))
             eff_signal = float(last.get("effective_signal", 0.0))
+            prev_eff_signal = float(prev.get("effective_signal", 0.0))
             regime_w = float(last.get("regime_weight", 0.0))
 
             # Conviction label
@@ -214,6 +216,7 @@ def compute_current_signals() -> dict[str, dict]:
                 "raw_signal": round(float(last.get("raw_signal", 0)), 2),
                 "smoothed_signal": round(float(last.get("smoothed_signal", 0)), 2),
                 "effective_signal": round(eff_signal, 2),
+                "prev_effective_signal": round(prev_eff_signal, 2),
                 "hysteresis_state": hyst_state,
                 "state_str": STATE_MAP.get(hyst_state, "FLAT"),
                 "regime_weight": round(regime_w, 2),
@@ -300,6 +303,7 @@ def determine_actions(
         action = None
         action_cn = None
         details = ""
+        action_data = {}
 
         # First run: just initialize, no action
         if first_run:
@@ -317,11 +321,13 @@ def determine_actions(
             if signal_state == "LONG":
                 action = "BUY"
                 action_cn = "买入"
-                details = f"Enter LONG at market open | 开盘买入做多"
+                details = (f"Signal {sig['prev_effective_signal']:+.1f} → {sig['effective_signal']:+.1f}. "
+                           f"Enter LONG. | 信号 {sig['prev_effective_signal']:+.1f} → {sig['effective_signal']:+.1f}. 买入做多.")
             elif signal_state == "SHORT":
                 action = "SELL_SHORT"
                 action_cn = "做空"
-                details = f"Enter SHORT at market open | 开盘做空"
+                details = (f"Signal {sig['prev_effective_signal']:+.1f} → {sig['effective_signal']:+.1f}. "
+                           f"Enter SHORT. | 信号 {sig['prev_effective_signal']:+.1f} → {sig['effective_signal']:+.1f}. 开盘做空.")
             else:
                 action = "HOLD_CASH"
                 action_cn = "持有现金"
@@ -329,12 +335,18 @@ def determine_actions(
 
         elif current_pos_state == "LONG":
             if signal_state == "LONG":
-                new_stop = sig["close"] - sig["atr"] * 2.0
+                old_ref_price = pos.get("reference_price", sig["close"])
+                new_ref_price = max(old_ref_price, sig["close"])
+                new_stop = new_ref_price - sig["atr"] * 2.0
                 old_stop = pos.get("stop_level", 0)
-                if new_stop > old_stop * 1.02:
+
+                action_data["new_ref_price"] = new_ref_price
+
+                if new_stop > old_stop:
                     action = "RAISE_STOP"
                     action_cn = "上调止损"
                     details = f"Hold LONG — raise stop to {new_stop:.2f} | 持多仓 — 上调止损至 {new_stop:.2f}"
+                    action_data["new_stop"] = new_stop
                 else:
                     action = "HOLD"
                     action_cn = "持有多仓"
@@ -342,20 +354,28 @@ def determine_actions(
             elif signal_state == "FLAT":
                 action = "SELL"
                 action_cn = "卖出平多"
-                details = f"Exit LONG — signal faded | 平多仓 — 信号消退"
+                details = (f"Signal {sig['prev_effective_signal']:+.1f} → {sig['effective_signal']:+.1f}. "
+                           f"Exit LONG. | 信号 {sig['prev_effective_signal']:+.1f} → {sig['effective_signal']:+.1f}. 平多仓.")
             elif signal_state == "SHORT":
                 action = "REVERSE_TO_SHORT"
                 action_cn = "多翻空"
-                details = f"Exit LONG & enter SHORT | 平多仓并做空 — 信号反转"
+                details = (f"Signal {sig['prev_effective_signal']:+.1f} → {sig['effective_signal']:+.1f}. "
+                           f"Exit LONG & enter SHORT. | 信号 {sig['prev_effective_signal']:+.1f} → {sig['effective_signal']:+.1f}. 平多仓并做空.")
 
         elif current_pos_state == "SHORT":
             if signal_state == "SHORT":
-                new_stop = sig["close"] + sig["atr"] * 2.0
+                old_ref_price = pos.get("reference_price", sig["close"])
+                new_ref_price = min(old_ref_price, sig["close"])
+                new_stop = new_ref_price + sig["atr"] * 2.0
                 old_stop = pos.get("stop_level", float("inf"))
-                if new_stop < old_stop * 0.98:
+
+                action_data["new_ref_price"] = new_ref_price
+
+                if new_stop < old_stop:
                     action = "LOWER_STOP"
                     action_cn = "下调止损"
                     details = f"Hold SHORT — lower stop to {new_stop:.2f} | 持空仓 — 下调止损至 {new_stop:.2f}"
+                    action_data["new_stop"] = new_stop
                 else:
                     action = "HOLD"
                     action_cn = "持有空仓"
@@ -363,11 +383,13 @@ def determine_actions(
             elif signal_state == "FLAT":
                 action = "COVER"
                 action_cn = "买入平空"
-                details = f"Cover SHORT — signal faded | 平空仓 — 信号消退"
+                details = (f"Signal {sig['prev_effective_signal']:+.1f} → {sig['effective_signal']:+.1f}. "
+                           f"Cover SHORT. | 信号 {sig['prev_effective_signal']:+.1f} → {sig['effective_signal']:+.1f}. 平空仓.")
             elif signal_state == "LONG":
                 action = "REVERSE_TO_LONG"
                 action_cn = "空翻多"
-                details = f"Cover SHORT & enter LONG | 平空仓并做多 — 信号反转"
+                details = (f"Signal {sig['prev_effective_signal']:+.1f} → {sig['effective_signal']:+.1f}. "
+                           f"Cover SHORT & enter LONG. | 信号 {sig['prev_effective_signal']:+.1f} → {sig['effective_signal']:+.1f}. 平空仓并做多.")
 
         actions.append({
             "ticker": ticker,
@@ -377,10 +399,12 @@ def determine_actions(
             "current_state": current_pos_state,
             "close": sig["close"],
             "effective_signal": sig["effective_signal"],
+            "prev_effective_signal": sig.get("prev_effective_signal"),
             "conviction_str": sig["conviction_str"],
             "regime_str": sig["regime_str"],
             "atr": sig["atr"],
             "details": details,
+            **action_data,
         })
 
     return actions
@@ -407,6 +431,7 @@ def update_positions(actions: list[dict], positions: dict, signals: dict) -> dic
                 "state": "LONG",
                 "entry_date": str(today),
                 "entry_price": sig.get("close", 0),
+                "reference_price": sig.get("close", 0),
                 "shares": 0,  # not computed in daily mode
                 "stop_level": round(sig.get("close", 0) - sig.get("atr", 0) * 2.0, 2),
                 "capital": "auto",
@@ -416,6 +441,7 @@ def update_positions(actions: list[dict], positions: dict, signals: dict) -> dic
                 "state": "SHORT",
                 "entry_date": str(today),
                 "entry_price": sig.get("close", 0),
+                "reference_price": sig.get("close", 0),
                 "shares": 0,
                 "stop_level": round(sig.get("close", 0) + sig.get("atr", 0) * 2.0, 2),
                 "capital": "auto",
@@ -429,15 +455,13 @@ def update_positions(actions: list[dict], positions: dict, signals: dict) -> dic
                 "stop_level": 0,
                 "capital": "auto",
             }
-        elif act["action"] == "RAISE_STOP":
+        elif act["action"] in ("RAISE_STOP", "LOWER_STOP"):
             if ticker in positions:
-                new_stop = round(sig.get("close", 0) - sig.get("atr", 0) * 2.0, 2)
-                positions[ticker]["stop_level"] = new_stop
-        elif act["action"] == "LOWER_STOP":
-            if ticker in positions:
-                new_stop = round(sig.get("close", 0) + sig.get("atr", 0) * 2.0, 2)
-                positions[ticker]["stop_level"] = new_stop
-        # HOLD: no change to position
+                positions[ticker]["stop_level"] = act["new_stop"]
+                positions[ticker]["reference_price"] = act["new_ref_price"]
+        elif act["action"] == "HOLD":
+            if ticker in positions and "new_ref_price" in act:
+                positions[ticker]["reference_price"] = act["new_ref_price"]
 
     save_positions(positions)
     return positions
@@ -466,6 +490,24 @@ def format_telegram_message(
     lines.append(f"📅 {today} ({weekday})")
     lines.append("")
 
+    # --- Summary of changes ---
+    opens = [a for a in actions if a['action'] in ('BUY', 'SELL_SHORT')]
+    closes = [a for a in actions if a['action'] in ('SELL', 'COVER')]
+    reversals = [a for a in actions if 'REVERSE' in a['action']]
+
+    if opens or closes or reversals:
+        lines.append("🔥 Today's Actions | 今日操作")
+        if opens:
+            for a in opens:
+                lines.append(f"  ➡️ Open {a['signal_state']} on {a['ticker']} | 建立 {a['ticker']} {a['action_cn']}仓位")
+        if closes:
+            for a in closes:
+                lines.append(f"  ⬅️ Close {a['current_state']} on {a['ticker']} | 平掉 {a['ticker']} {a['action_cn']}仓位")
+        if reversals:
+            for a in reversals:
+                lines.append(f"  🔄 Reverse {a['ticker']} to {a['signal_state']} | {a['ticker']} {a['action_cn']}")
+        lines.append("")
+
     # --- Actionable signals table ---
     lines.append("━" * 30)
     lines.append("📈 SIGNALS | 信号")
@@ -477,16 +519,8 @@ def format_telegram_message(
         "REVERSE_TO_LONG", "REVERSE_TO_SHORT"
     ]
     hold_actions = ["HOLD", "HOLD_CASH", "RAISE_STOP", "LOWER_STOP"]
-    init_actions = ["INIT", "INIT_CASH"]
 
-    # Init / first-run setup
-    init = [a for a in actions if a["action"] in init_actions]
-    if init:
-        lines.append("[SETUP] INITIAL SETUP | 初始化设置")
-        for a in init:
-            emoji = STATE_EMOJI.get(a["signal_state"], "⚪")
-            lines.append(f"{emoji} {a['ticker']:<6} | {a['action_cn']} | Sig: {a['effective_signal']:+.1f}")
-        lines.append("")
+    # Init / first-run setup is no longer shown in the report
 
     # Urgent actions first
     urgent = [a for a in actions if a["action"] in urgent_actions]
@@ -543,12 +577,18 @@ def format_telegram_message(
 
     warnings = []
     for a in actions:
-        if a.get("effective_signal", 0) != 0 and abs(a.get("effective_signal", 0)) < 15:
-            warnings.append(
-                f"⚠️ {a['ticker']}: Weak signal — use caution | 信号弱 — 谨慎操作"
-            )
         if a.get("action") == "ERROR":
             warnings.append(f"❌ {a['ticker']}: Data error — {a.get('details', 'unknown')}")
+            continue
+
+        is_in_pos = a.get("current_state") in ("LONG", "SHORT")
+        eff_sig = a.get("effective_signal", 0)
+
+        if is_in_pos and a.get("action") in ("HOLD", "RAISE_STOP", "LOWER_STOP"):
+            if a.get("current_state") == "LONG" and 15.0 <= eff_sig < 25.0:
+                warnings.append(f"⚠️ {a['ticker']}: LONG signal {eff_sig:+.1f} is approaching exit level (15.0). | 多头信号 {eff_sig:+.1f} 接近平仓水平 (15.0).")
+            elif a.get("current_state") == "SHORT" and -30.0 < eff_sig <= -20.0:
+                warnings.append(f"⚠️ {a['ticker']}: SHORT signal {eff_sig:+.1f} is approaching cover level (-20.0). | 空头信号 {eff_sig:+.1f} 接近平仓水平 (-20.0).")
 
     if warnings:
         for w in warnings:
